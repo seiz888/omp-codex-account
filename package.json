@@ -1,25 +1,27 @@
 {
   "name": "pi-codex-account",
   "version": "0.1.1",
-  "description": "Pi extension to switch between multiple OpenAI Codex OAuth accounts and show usage for the active account.",
+  "description": "Oh My Pi extension to switch between multiple OpenAI Codex OAuth accounts via OMP agent.db or legacy Pi auth.json.",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi-extension",
     "codex",
     "openai",
-    "oauth"
+    "oauth",
+    "oh-my-pi",
+    "omp"
   ],
   "license": "MIT",
   "author": "",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/fadilsflow/pi-codex-account.git"
+    "url": "git+https://github.com/MateuszJuszczyk/pi-codex-account.git"
   },
   "bugs": {
-    "url": "https://github.com/fadilsflow/pi-codex-account/issues"
+    "url": "https://github.com/MateuszJuszczyk/pi-codex-account/issues"
   },
-  "homepage": "https://github.com/fadilsflow/pi-codex-account#readme",
+  "homepage": "https://github.com/MateuszJuszczyk/pi-codex-account#readme",
   "files": [
     "src",
     "assets",

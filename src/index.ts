@@ -1,18 +1,58 @@
-/** Switch between saved OpenAI Codex OAuth credential snapshots in pi. */
+/**
+ * codex-accounts — switch between multiple OpenAI Codex (ChatGPT) logins in pi.
+ *
+ * pi only stores ONE set of `openai-codex` OAuth credentials at a time.
+ * This extension keeps named snapshots and lets you swap which one is active.
+ *
+ * Two storage backends:
+ *   AuthJsonStorage    — legacy ~/.pi/agent/auth.json + codex-accounts.json
+ *   OmpAgentDbStorage  — OMP ~/.omp/agent/agent.db (bun:sqlite) + separate
+ *                        snapshot files at ~/.omp/codex-accounts/<label>.json
+ *
+ * Auto-detected via resolveActiveStorage(): OMP preferred when agent.db exists
+ * and has openai-codex credentials; falls back to AuthJsonStorage.
+ *
+ * Commands:
+ *   /codex                 Interactive: pick an account to switch to
+ *   /codex list            List saved accounts (active one marked)
+ *   /codex current         Show which account is active right now
+ *   /codex save <label>    Snapshot the CURRENT logged-in codex creds
+ *   /codex switch <label>  Make <label> the active codex account
+ *   /codex usage           Show usage for the active account
+ *   /codex status          Show storage backend info (no tokens)
+ *   /codex debug-db        Show DB schema/provider counts (no tokens)
+ *   /codex rename <a> <b>  Rename account <a> to <b>
+ *   /codex remove <label>  Delete a saved account
+ *
+ * Typical flow:
+ *   1. /login openai-codex            (log in to account #1)
+ *   2. /codex save work               (snapshot it as "work")
+ *   3. /login openai-codex            (log in to account #2)
+ *   4. /codex save personal           (snapshot it as "personal")
+ *   5. /codex switch work             (swap back to account #1 — auto reloads)
+ *   6. /codex usage                   (show usage for the active account)
+ */
 
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
+  ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
   writeFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+// @ts-ignore - OMP runs plugins on Bun; some packaged installs do not carry bun:sqlite declarations.
+import { Database } from "bun:sqlite";
 
 const CODEX_PROVIDER_ID = "openai-codex";
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -21,22 +61,8 @@ const DEFAULT_USAGE_TIMEOUT_MS = 15_000;
 const BAR_SEGMENTS = 20;
 const LIMIT_VALUE_COLUMN = 29;
 const MAX_ERROR_BODY_CHARS = 600;
-const SUBCOMMANDS = [
-  "list",
-  "current",
-  "save",
-  "switch",
-  "usage",
-  "rename",
-  "remove",
-] as const;
-const LABEL_COMPLETION_SUBCOMMANDS = new Set<string>([
-  "switch",
-  "remove",
-  "rename",
-]);
 
-/** Shape of an `openai-codex` OAuth credential as stored in auth.json. */
+/** Shape of an `openai-codex` OAuth credential. */
 export interface CodexCredential {
   type: "oauth";
   access: string;
@@ -47,7 +73,7 @@ export interface CodexCredential {
 }
 
 export interface SavedAccount {
-  /** The credential snapshot. `expires` is the real expiry from auth.json. */
+  /** The credential snapshot. */
   credential: CodexCredential;
   /** When this snapshot was saved (ms). */
   savedAt: number;
@@ -63,14 +89,56 @@ export interface AccountsStore {
 }
 
 // ---------------------------------------------------------------------------
-// Paths
+// Storage abstraction layer
 // ---------------------------------------------------------------------------
 
-/**
- * Resolve pi's agent dir the same way pi does: the PI_CODING_AGENT_DIR override
- * (with ~ expansion), else ~/.pi/agent. We keep both the canonical auth.json
- * and our own accounts store inside it.
- */
+export interface StorageDebugInfo {
+  kind: string;
+  path: string;
+  hasCodexRows: boolean;
+  providerRowCount: number;
+  tables: Array<{ name: string; columns: Array<{ name: string; type: string }> }>;
+}
+
+export interface ICredentialStorage {
+  /** Read the currently active codex credential, if any. */
+  readActiveCredential(): CodexCredential | undefined;
+
+  /** Write a codex credential as the active one. */
+  writeActiveCredential(credential: CodexCredential): void;
+
+  /** List saved account labels, sorted. */
+  listLabels(): string[];
+
+  /** Read a saved account by label. */
+  readAccount(label: string): SavedAccount | undefined;
+
+  /** Save or update an account. */
+  saveAccount(label: string, account: SavedAccount): void;
+
+  /** Remove a saved account. */
+  removeAccount(label: string): void;
+
+  /** Rename a saved account. Returns false if source missing or target exists. */
+  renameAccount(from: string, to: string): boolean;
+
+  /** Detect which saved label matches the active credential. */
+  detectActiveLabel(credential: CodexCredential | undefined): string | undefined;
+
+  /** Switch active credential to the one from a saved account. */
+  switchTo(credential: CodexCredential, label: string): void;
+
+  /** Human-readable storage description (no tokens). */
+  description(): string;
+
+  /** Debug info (schema/counts, no token values). */
+  debugInfo(): StorageDebugInfo;
+}
+
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
 function getAgentDir(): string {
   const override = process.env.PI_CODING_AGENT_DIR;
   if (override && override.trim().length > 0) {
@@ -82,16 +150,20 @@ function getAgentDir(): string {
   return join(homedir(), ".pi", "agent");
 }
 
-function getAuthPath(): string {
-  return join(getAgentDir(), "auth.json");
+function getOmpAgentDbPath(): string {
+  const override = process.env.OMP_AGENT_DB_PATH;
+  if (override && override.trim().length > 0) return override.trim();
+  return join(homedir(), ".omp", "agent", "agent.db");
 }
 
-function getStorePath(): string {
-  return join(getAgentDir(), "codex-accounts.json");
+function getOmpCodexAccountsDir(): string {
+  const override = process.env.OMP_CODEX_ACCOUNTS_DIR;
+  if (override && override.trim().length > 0) return override.trim();
+  return join(homedir(), ".omp", "codex-accounts");
 }
 
 // ---------------------------------------------------------------------------
-// auth.json access
+// JSON file helpers
 // ---------------------------------------------------------------------------
 
 function readJsonFile<T>(path: string, fallback: T): T {
@@ -119,62 +191,966 @@ function writeJsonFileSecure(path: string, data: unknown): void {
   }
 }
 
-function isCodexCredential(value: unknown): value is CodexCredential {
-  if (!value || typeof value !== "object") return false;
-  const credential = value as Record<string, unknown>;
-  return (
-    credential.type === "oauth" &&
-    typeof credential.access === "string" &&
-    typeof credential.refresh === "string"
-  );
-}
-
-/** Read the currently-active openai-codex credential from auth.json, if any. */
-function readActiveCodexCredential(): CodexCredential | undefined {
-  const auth = readJsonFile<Record<string, unknown>>(getAuthPath(), {});
-  const credential = auth[CODEX_PROVIDER_ID];
-  return isCodexCredential(credential) ? credential : undefined;
-}
-
-/**
- * Write a codex credential into auth.json as the active openai-codex entry.
- *
- * We set `expires: 0` so pi's in-memory AuthStorage (which caches credentials
- * and only re-reads auth.json from disk on a refresh) treats the token as
- * expired on the next request. That forces a locked refresh, which re-reads the
- * file (picking up this swap) and rotates the access token using the new
- * account's refresh token. The on-disk `refresh` token is the source of truth,
- * so the swapped account becomes active cleanly.
- */
-export function writeActiveCodexCredential(credential: CodexCredential): void {
-  const authPath = getAuthPath();
-  const auth = readJsonFile<Record<string, unknown>>(authPath, {});
-  auth[CODEX_PROVIDER_ID] = {
-    ...credential,
-    type: "oauth",
-    // Force pi to refresh-from-disk on next use so the swap takes effect.
-    expires: 0,
-  };
-  writeJsonFileSecure(authPath, auth);
-}
-
-// ---------------------------------------------------------------------------
-// accounts store access
-// ---------------------------------------------------------------------------
-
-export function loadStore(): AccountsStore {
-  const store = readJsonFile<Partial<AccountsStore>>(getStorePath(), {});
+/** Safely parse a JSON value into a CodexCredential. */
+export function normalizedCredential(
+  value: unknown,
+): CodexCredential | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const obj = value as Record<string, unknown>;
+  const access = typeof obj.access === "string"
+    ? obj.access
+    : typeof obj.access_token === "string"
+      ? obj.access_token
+      : undefined;
+  const refresh = typeof obj.refresh === "string"
+    ? obj.refresh
+    : typeof obj.refresh_token === "string"
+      ? obj.refresh_token
+      : undefined;
+  if (!access || !refresh) return undefined;
+  const expires = typeof obj.expires === "number"
+    ? obj.expires
+    : typeof obj.expires_at === "number"
+      ? obj.expires_at
+      : 0;
   return {
-    accounts:
-      store.accounts && typeof store.accounts === "object"
-        ? store.accounts
-        : {},
-    active: typeof store.active === "string" ? store.active : undefined,
+    ...obj,
+    type: "oauth",
+    access,
+    refresh,
+    expires,
+    accountId: typeof obj.accountId === "string" ? obj.accountId : undefined,
   };
+}
+
+// ---------------------------------------------------------------------------
+// AuthJsonStorage — legacy ~/.pi/agent/auth.json + codex-accounts.json
+// ---------------------------------------------------------------------------
+
+export class AuthJsonStorage implements ICredentialStorage {
+  private agentDir: string;
+
+  constructor(agentDir?: string) {
+    this.agentDir = agentDir ?? getAgentDir();
+  }
+
+  private authPath(): string {
+    return join(this.agentDir, "auth.json");
+  }
+
+  private storePath(): string {
+    return join(this.agentDir, "codex-accounts.json");
+  }
+
+  readActiveCredential(): CodexCredential | undefined {
+    const auth = readJsonFile<Record<string, unknown>>(this.authPath(), {});
+    return normalizedCredential(auth[CODEX_PROVIDER_ID]);
+  }
+
+  writeActiveCredential(credential: CodexCredential): void {
+    const authPath = this.authPath();
+    const auth = readJsonFile<Record<string, unknown>>(authPath, {});
+    auth[CODEX_PROVIDER_ID] = {
+      ...credential,
+      type: "oauth",
+      // Force pi to refresh-from-disk on next use so the swap takes effect.
+      expires: 0,
+    };
+    writeJsonFileSecure(authPath, auth);
+  }
+
+  private loadStore(): AccountsStore {
+    const store = readJsonFile<Partial<AccountsStore>>(this.storePath(), {});
+    return {
+      accounts:
+        store.accounts && typeof store.accounts === "object"
+          ? store.accounts
+          : ({} as Record<string, SavedAccount>),
+      active: typeof store.active === "string" ? store.active : undefined,
+    };
+  }
+
+  private saveStore(store: AccountsStore): void {
+    writeJsonFileSecure(this.storePath(), store);
+  }
+
+  listLabels(): string[] {
+    return Object.keys(this.loadStore().accounts).sort();
+  }
+
+  readAccount(label: string): SavedAccount | undefined {
+    return this.loadStore().accounts[label];
+  }
+
+  saveAccount(label: string, account: SavedAccount): void {
+    const store = this.loadStore();
+    store.accounts[label] = account;
+    store.active = label;
+    this.saveStore(store);
+  }
+
+  removeAccount(label: string): void {
+    const store = this.loadStore();
+    delete store.accounts[label];
+    if (store.active === label) store.active = undefined;
+    this.saveStore(store);
+  }
+
+  renameAccount(from: string, to: string): boolean {
+    const store = this.loadStore();
+    if (!store.accounts[from]) return false;
+    if (store.accounts[to]) return false;
+    store.accounts[to] = store.accounts[from]!;
+    delete store.accounts[from];
+    if (store.active === from) store.active = to;
+    this.saveStore(store);
+    return true;
+  }
+
+  detectActiveLabel(credential: CodexCredential | undefined): string | undefined {
+    if (!credential) return undefined;
+    const store = this.loadStore();
+    for (const [label, acct] of Object.entries(store.accounts)) {
+      const c = acct.credential;
+      if (
+        credential.accountId &&
+        c.accountId &&
+        credential.accountId === c.accountId
+      ) {
+        return label;
+      }
+    }
+    for (const [label, acct] of Object.entries(store.accounts)) {
+      if (acct.credential.refresh === credential.refresh) return label;
+    }
+    return store.active;
+  }
+
+  switchTo(credential: CodexCredential, label: string): void {
+    // Auto-snapshot the currently-active account first
+    const store = this.loadStore();
+    const currentActive = this.readActiveCredential();
+    if (currentActive) {
+      const activeLabel = this.detectActiveLabel(currentActive);
+      if (activeLabel && store.accounts[activeLabel]) {
+        store.accounts[activeLabel] = {
+          ...store.accounts[activeLabel]!,
+          credential: { ...currentActive, type: "oauth" },
+        };
+      }
+    }
+
+    this.writeActiveCredential(credential);
+
+    // Update last used time
+    if (store.accounts[label]) {
+      store.accounts[label] = {
+        ...store.accounts[label]!,
+        lastUsedAt: Date.now(),
+      };
+    }
+    store.active = label;
+    this.saveStore(store);
+  }
+
+  description(): string {
+    const authPath = this.authPath();
+    return `AuthJsonStorage (auth: ${authPath}, store: ${this.storePath()})`;
+  }
+
+  debugInfo(): StorageDebugInfo {
+    const authPath = this.authPath();
+    const auth = readJsonFile<Record<string, unknown>>(authPath, {});
+    const hasCodexRows = !!normalizedCredential(auth[CODEX_PROVIDER_ID]);
+    return {
+      kind: "AuthJsonStorage",
+      path: authPath,
+      hasCodexRows,
+      providerRowCount: hasCodexRows ? 1 : 0,
+      tables: [],
+    };
+  }
+}
+
+// Backward-compatible test/public helpers from the original package. They operate
+// on the legacy auth.json backend only; command handlers use resolveActiveStorage().
+export function loadStore(): AccountsStore {
+  const storage = new AuthJsonStorage() as unknown as { loadStore(): AccountsStore };
+  return storage.loadStore();
 }
 
 export function saveStore(store: AccountsStore): void {
-  writeJsonFileSecure(getStorePath(), store);
+  const storage = new AuthJsonStorage() as unknown as { saveStore(store: AccountsStore): void };
+  storage.saveStore(store);
+}
+
+export function writeActiveCodexCredential(credential: CodexCredential): void {
+  new AuthJsonStorage().writeActiveCredential(credential);
+}
+
+export function detectActiveLabel(
+  store: AccountsStore,
+  active: CodexCredential | undefined,
+): string | undefined {
+  if (!active) return undefined;
+  for (const [label, acct] of Object.entries(store.accounts)) {
+    const credential = acct.credential;
+    if (
+      active.accountId &&
+      credential.accountId &&
+      active.accountId === credential.accountId
+    ) {
+      return label;
+    }
+  }
+  for (const [label, acct] of Object.entries(store.accounts)) {
+    if (acct.credential.refresh === active.refresh) return label;
+  }
+  return store.active;
+}
+
+// ---------------------------------------------------------------------------
+// OmpAgentDbStorage — OMP bun:sqlite agent.db + snapshot files
+// ---------------------------------------------------------------------------
+
+/**
+ * Shape of an OMP credential snapshot saved to disk. Carries all original
+ * DB columns needed to restore the row, plus a normalized CodexCredential
+ * for existing UI/usage code.
+ */
+export interface OmpCredentialSnapshot {
+  /** DB column values for restore */
+  row: {
+    provider: string;
+    credential_type: string;
+    data: Record<string, unknown>;
+    identity_key: string | null;
+    disabled_cause: string | null;
+  };
+  /** Normalized credential for existing UI */
+  credential: CodexCredential;
+  /** Metadata */
+  savedAt: number;
+  lastUsedAt?: number;
+}
+
+interface AuthCredColumns {
+  id: boolean;
+  provider: boolean;
+  credential_type: boolean;
+  data: boolean;
+  disabled_cause: boolean;
+  identity_key: boolean;
+  created_at: boolean;
+  updated_at: boolean;
+}
+
+interface TableIntrospection {
+  hasAuthCredentials: boolean;
+  tableName?: string;
+  columns: AuthCredColumns;
+  error?: string;
+}
+
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, "\"\"")}"`;
+}
+
+function runSql(db: Database, sql: string, ...bindings: unknown[]): void {
+  (db.run as unknown as (query: string, ...params: unknown[]) => void)(
+    sql,
+    ...bindings,
+  );
+}
+
+function introspectCredentialsTable(db: Database): TableIntrospection {
+  try {
+    const tables = db
+      .query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY CASE WHEN name = 'auth_credentials' THEN 0 ELSE 1 END, name")
+      .all() as Array<{ name: string }>;
+
+    for (const table of tables) {
+      const cols = db
+        .query(`PRAGMA table_info(${quoteIdent(table.name)})`)
+        .all() as Array<{ name: string; type: string }>;
+      const colNames = new Set(cols.map((c) => c.name));
+      const columns = {
+        id: colNames.has("id"),
+        provider: colNames.has("provider"),
+        credential_type: colNames.has("credential_type"),
+        data: colNames.has("data"),
+        disabled_cause: colNames.has("disabled_cause"),
+        identity_key: colNames.has("identity_key"),
+        created_at: colNames.has("created_at"),
+        updated_at: colNames.has("updated_at"),
+      };
+      if (!columns.provider || !columns.data) continue;
+
+      try {
+        const rows = db
+          .query(`SELECT COUNT(*) AS cnt FROM ${quoteIdent(table.name)} WHERE provider = ?`)
+          .all(CODEX_PROVIDER_ID) as Array<{ cnt: number }>;
+        if ((rows[0]?.cnt ?? 0) > 0 || table.name === "auth_credentials") {
+          return {
+            hasAuthCredentials: true,
+            tableName: table.name,
+            columns,
+          };
+        }
+      } catch {
+        // Not a provider/data credential table.
+      }
+    }
+
+    return { hasAuthCredentials: false, columns: blankColumns() };
+  } catch (e) {
+    return {
+      hasAuthCredentials: false,
+      columns: blankColumns(),
+      error: String(e),
+    };
+  }
+}
+
+function blankColumns(): AuthCredColumns {
+  return {
+    id: false,
+    provider: false,
+    credential_type: false,
+    data: false,
+    disabled_cause: false,
+    identity_key: false,
+    created_at: false,
+    updated_at: false,
+  };
+}
+
+/** Is this credential currently blocked in auth_credential_blocks? */
+function isCredentialBlocked(db: Database, credentialId: number): boolean {
+  try {
+    const rows = db
+      .query(
+        "SELECT 1 FROM auth_credential_blocks WHERE credential_id = ? AND (blocked_until_ms IS NULL OR blocked_until_ms > ?) LIMIT 1",
+      )
+      .all(credentialId, Date.now()) as Array<Record<string, unknown>>;
+    return rows.length > 0;
+  } catch {
+    // Table may not exist or other error — assume not blocked.
+    return false;
+  }
+}
+
+export class OmpAgentDbStorage implements ICredentialStorage {
+  private dbPath: string;
+  private snapshotsDir: string;
+  private activeLabelPath: string;
+
+  constructor(dbPath?: string, snapshotsDir?: string) {
+    this.dbPath = dbPath ?? getOmpAgentDbPath();
+    this.snapshotsDir = snapshotsDir ?? getOmpCodexAccountsDir();
+    this.activeLabelPath = join(this.snapshotsDir, "active-label");
+  }
+
+  private openDb(readonly = false): Database {
+    return readonly
+      ? new Database(this.dbPath, { readonly: true })
+      : new Database(this.dbPath);
+  }
+
+  description(): string {
+    return `OmpAgentDbStorage (db: ${this.dbPath}, snapshots: ${this.snapshotsDir})`;
+  }
+
+  debugInfo(): StorageDebugInfo {
+    try {
+      const db = this.openDb(true);
+      try {
+        const intro = introspectCredentialsTable(db);
+        let providerRowCount = 0;
+        if (intro.hasAuthCredentials && intro.columns.provider) {
+          const countRows = db
+            .query(
+              `SELECT COUNT(*) AS cnt FROM ${quoteIdent(intro.tableName ?? "auth_credentials")} WHERE provider = ?`,
+            )
+            .all(CODEX_PROVIDER_ID) as Array<{ cnt: number }>;
+          providerRowCount = countRows[0]?.cnt ?? 0;
+        }
+
+        const tables: Array<{ name: string; columns: Array<{ name: string; type: string }> }> = [];
+        try {
+          const allTables = db
+            .query(
+              "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            )
+            .all() as Array<{ name: string }>;
+          for (const t of allTables) {
+            const cols = db
+              .query(`PRAGMA table_info('${t.name}')`)
+              .all() as Array<{ name: string; type: string }>;
+            tables.push({ name: t.name, columns: cols });
+          }
+        } catch {
+          // Best-effort — some tables may not support PRAGMA
+        }
+
+        return {
+          kind: "OmpAgentDbStorage",
+          path: this.dbPath,
+          hasCodexRows: providerRowCount > 0,
+          providerRowCount,
+          tables,
+        };
+      } finally {
+        db.close();
+      }
+    } catch {
+      return {
+        kind: "OmpAgentDbStorage",
+        path: this.dbPath,
+        hasCodexRows: false,
+        providerRowCount: 0,
+        tables: [],
+      };
+    }
+  }
+
+  /**
+   * Find the currently active openai-codex oauth row.
+   * Prefers the newest non-disabled row that is not currently blocked.
+   * If all are blocked, returns the newest non-disabled row.
+   */
+  private findActiveRow(
+    db: Database,
+  ): {
+    id: number;
+    data: Record<string, unknown>;
+    row: Record<string, unknown>;
+  } | null {
+    const intro = introspectCredentialsTable(db);
+    if (
+      !intro.hasAuthCredentials ||
+      !intro.columns.provider ||
+      !intro.columns.data
+    ) {
+      return null;
+    }
+
+    const rows = db
+      .query(
+        `SELECT * FROM ${quoteIdent(intro.tableName ?? "auth_credentials")}
+         WHERE provider = ? AND credential_type = ?
+         AND disabled_cause IS NULL
+         ORDER BY id DESC`,
+      )
+      .all(CODEX_PROVIDER_ID, "oauth") as Array<Record<string, unknown>>;
+
+    if (rows.length === 0) return null;
+
+    // First non-blocked row
+    if (intro.columns.id) {
+      for (const row of rows) {
+        const id = row.id as number;
+        if (!isCredentialBlocked(db, id)) {
+          return {
+            id,
+            data: parseDataField(row.data),
+            row,
+          };
+        }
+      }
+    }
+
+    // All blocked — fall back to newest non-disabled row
+    const newest = rows[0]!;
+    return {
+      id: intro.columns.id ? (newest.id as number) : -1,
+      data: parseDataField(newest.data),
+      row: newest,
+    };
+  }
+
+  readActiveCredential(): CodexCredential | undefined {
+    try {
+      const db = this.openDb(true);
+      try {
+        const found = this.findActiveRow(db);
+        if (!found) return undefined;
+        const credential = normalizedCredential(found.data);
+        return credential ? { ...found.data, ...credential, type: "oauth" } : undefined;
+      } finally {
+        db.close();
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  writeActiveCredential(credential: CodexCredential): void {
+    const db = this.openDb();
+    try {
+      const intro = introspectCredentialsTable(db);
+      if (!intro.hasAuthCredentials) return;
+
+      const found = this.findActiveRow(db);
+      if (!found) {
+        this.backupDb();
+        runSql(
+          db,
+          `INSERT INTO ${quoteIdent(intro.tableName ?? "auth_credentials")} (provider, credential_type, data, identity_key)
+           VALUES (?, ?, ?, ?)`,
+          CODEX_PROVIDER_ID,
+          "oauth",
+          JSON.stringify({
+            ...credential,
+            type: "oauth",
+            expires: 0,
+          }),
+          credential.accountId
+            ? `account:${credential.accountId}`
+            : null,
+        );
+        return;
+      }
+
+      this.backupDb();
+
+      const newData = {
+        ...credential,
+        type: "oauth",
+        expires: 0,
+      };
+
+      const updates: string[] = [];
+      const params: unknown[] = [];
+
+      if (intro.columns.provider) {
+        updates.push("provider = ?");
+        params.push(CODEX_PROVIDER_ID);
+      }
+      if (intro.columns.credential_type) {
+        updates.push("credential_type = ?");
+        params.push("oauth");
+      }
+      if (intro.columns.data) {
+        updates.push("data = ?");
+        params.push(JSON.stringify(newData));
+      }
+      if (intro.columns.identity_key) {
+        updates.push("identity_key = ?");
+        params.push(
+          credential.accountId
+            ? `account:${credential.accountId}`
+            : null,
+        );
+      }
+      if (intro.columns.disabled_cause) {
+        updates.push("disabled_cause = ?");
+        params.push(null);
+      }
+      if (intro.columns.updated_at) {
+        updates.push("updated_at = CAST(strftime('%s','now') AS INTEGER)");
+      }
+
+      if (intro.columns.id) {
+        params.push(found.id);
+        runSql(
+          db,
+          `UPDATE ${quoteIdent(intro.tableName ?? "auth_credentials")} SET ${updates.join(", ")} WHERE id = ?`,
+          ...params,
+        );
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  listLabels(): string[] {
+    if (!existsSync(this.snapshotsDir)) return [];
+    const labels: string[] = [];
+    try {
+      const entries = readdirSync(this.snapshotsDir);
+      for (const entry of entries) {
+        if (entry === "active-label") continue;
+        if (entry.endsWith(".json")) {
+          labels.push(entry.slice(0, -5));
+        }
+      }
+    } catch {
+      // best effort
+    }
+    return labels.sort();
+  }
+
+  readAccount(label: string): SavedAccount | undefined {
+    const snap = this.readSnapshot(label);
+    if (!snap) return undefined;
+    return {
+      credential: snap.credential,
+      savedAt: snap.savedAt,
+      lastUsedAt: snap.lastUsedAt,
+    };
+  }
+
+  saveAccount(label: string, account: SavedAccount): void {
+    const credential = account.credential;
+    let row: OmpCredentialSnapshot["row"] = {
+      provider: CODEX_PROVIDER_ID,
+      credential_type: "oauth",
+      data: { ...credential },
+      identity_key: credential.accountId
+        ? `account:${credential.accountId}`
+        : null,
+      disabled_cause: null,
+    };
+
+    try {
+      const db = this.openDb(true);
+      try {
+        const found = this.findActiveRow(db);
+        if (found) {
+          row = {
+            provider: String(found.row.provider ?? CODEX_PROVIDER_ID),
+            credential_type: String(found.row.credential_type ?? "oauth"),
+            data: parseDataField(found.row.data),
+            identity_key:
+              typeof found.row.identity_key === "string"
+                ? found.row.identity_key
+                : null,
+            disabled_cause:
+              typeof found.row.disabled_cause === "string"
+                ? found.row.disabled_cause
+                : null,
+          };
+        }
+      } finally {
+        db.close();
+      }
+    } catch {
+      // Fall back to normalized credential data; snapshot still remains restorable.
+    }
+
+    const snapshot: OmpCredentialSnapshot = {
+      row,
+      credential: { ...row.data, ...credential, type: "oauth" },
+      savedAt: account.savedAt,
+      lastUsedAt: account.lastUsedAt,
+    };
+    this.writeSnapshot(label, snapshot);
+    this.writeActiveLabel(label);
+  }
+
+  removeAccount(label: string): void {
+    const path = this.snapshotPath(label);
+    try {
+      if (existsSync(path)) {
+        rmSync(path);
+      }
+    } catch {
+      // best effort
+    }
+    const current = this.readActiveLabel();
+    if (current === label) {
+      this.writeActiveLabel(undefined);
+    }
+  }
+
+  renameAccount(from: string, to: string): boolean {
+    const fromPath = this.snapshotPath(from);
+    const toPath = this.snapshotPath(to);
+    if (!existsSync(fromPath)) return false;
+    if (existsSync(toPath)) return false;
+    try {
+      renameSync(fromPath, toPath);
+      const active = this.readActiveLabel();
+      if (active === from) {
+        this.writeActiveLabel(to);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  detectActiveLabel(credential: CodexCredential | undefined): string | undefined {
+    if (!credential) return undefined;
+
+    // First try the stored active label
+    const stored = this.readActiveLabel();
+    if (stored) {
+      const acct = this.readAccount(stored);
+      if (acct) {
+        const c = acct.credential;
+        if (
+          credential.accountId &&
+          c.accountId &&
+          credential.accountId === c.accountId
+        ) {
+          return stored;
+        }
+        if (c.refresh === credential.refresh) {
+          return stored;
+        }
+      }
+    }
+
+    // Fall back to scanning all labels
+    const labels = this.listLabels();
+    for (const label of labels) {
+      const snap = this.readSnapshot(label);
+      if (!snap) continue;
+      const c = snap.credential;
+      if (
+        credential.accountId &&
+        c.accountId &&
+        credential.accountId === c.accountId
+      ) {
+        return label;
+      }
+    }
+    for (const label of labels) {
+      const snap = this.readSnapshot(label);
+      if (!snap) continue;
+      if (snap.credential.refresh === credential.refresh) {
+        return label;
+      }
+    }
+    return stored;
+  }
+
+  switchTo(credential: CodexCredential, label: string): void {
+    const db = this.openDb();
+    try {
+      const intro = introspectCredentialsTable(db);
+      if (!intro.hasAuthCredentials) return;
+
+      // Auto-snapshot current active credential before switching
+      const currentActive = this.readActiveCredential();
+      if (currentActive) {
+        const activeLabel = this.detectActiveLabel(currentActive);
+        if (activeLabel) {
+          const existing = this.readAccount(activeLabel);
+          if (existing) {
+            this.saveAccount(activeLabel, {
+              ...existing,
+              credential: { ...currentActive, type: "oauth" },
+              savedAt: existing.savedAt,
+            });
+          }
+        }
+      }
+
+      this.backupDb();
+
+      // Find the currently active row and update its fields from the snapshot
+      const snapshot = this.readSnapshot(label);
+      if (!snapshot) return;
+
+      const found = this.findActiveRow(db);
+      if (!found) {
+        runSql(
+          db,
+          `INSERT INTO ${quoteIdent(intro.tableName ?? "auth_credentials")} (provider, credential_type, data, identity_key)
+           VALUES (?, ?, ?, ?)`,
+          CODEX_PROVIDER_ID,
+          "oauth",
+          JSON.stringify({
+            ...credential,
+            type: "oauth",
+            expires: 0,
+          }),
+          credential.accountId
+            ? `account:${credential.accountId}`
+            : null,
+        );
+      } else {
+        const mergedData = {
+          ...snapshot.row.data,
+          access: credential.access,
+          refresh: credential.refresh,
+          expires: credential.expires,
+          accountId: credential.accountId,
+          type: "oauth",
+        };
+
+        const updates: string[] = [];
+        const params: unknown[] = [];
+
+        if (intro.columns.provider) {
+          updates.push("provider = ?");
+          params.push(CODEX_PROVIDER_ID);
+        }
+        if (intro.columns.credential_type) {
+          updates.push("credential_type = ?");
+          params.push("oauth");
+        }
+        if (intro.columns.data) {
+          updates.push("data = ?");
+          params.push(JSON.stringify(mergedData));
+        }
+        if (intro.columns.identity_key) {
+          updates.push("identity_key = ?");
+          params.push(
+            credential.accountId
+              ? `account:${credential.accountId}`
+              : null,
+          );
+        }
+        if (intro.columns.disabled_cause) {
+          updates.push("disabled_cause = ?");
+          params.push(snapshot.row.disabled_cause);
+        }
+        if (intro.columns.updated_at) {
+          updates.push("updated_at = CAST(strftime('%s','now') AS INTEGER)");
+        }
+
+        if (intro.columns.id) {
+          params.push(found.id);
+          runSql(
+            db,
+            `UPDATE ${quoteIdent(intro.tableName ?? "auth_credentials")} SET ${updates.join(", ")} WHERE id = ?`,
+            ...params,
+          );
+        }
+      }
+    } finally {
+      db.close();
+    }
+
+    this.writeActiveLabel(label);
+
+    // Update the snapshot's lastUsedAt
+    const existingSnapshot = this.readSnapshot(label);
+    if (existingSnapshot) {
+      existingSnapshot.lastUsedAt = Date.now();
+      this.writeSnapshot(label, existingSnapshot);
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Internal snapshot management
+  // -----------------------------------------------------------------------
+
+  private snapshotPath(label: string): string {
+    return join(this.snapshotsDir, `${sanitizeLabel(label)}.json`);
+  }
+
+  private readSnapshot(label: string): OmpCredentialSnapshot | undefined {
+    const path = this.snapshotPath(label);
+    if (!existsSync(path)) return undefined;
+    try {
+      const raw = readFileSync(path, "utf-8").trim();
+      if (!raw) return undefined;
+      const parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        parsed.credential &&
+        typeof parsed.row === "object"
+      ) {
+        return parsed as OmpCredentialSnapshot;
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private writeSnapshot(label: string, snapshot: OmpCredentialSnapshot): void {
+    const dir = this.snapshotsDir;
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeJsonFileSecure(this.snapshotPath(label), snapshot);
+  }
+
+  private readActiveLabel(): string | undefined {
+    try {
+      if (!existsSync(this.activeLabelPath)) return undefined;
+      const raw = readFileSync(this.activeLabelPath, "utf-8").trim();
+      return raw || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private writeActiveLabel(label: string | undefined): void {
+    const dir = dirname(this.activeLabelPath);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (label) {
+      writeFileSync(this.activeLabelPath, label, {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
+    } else {
+      try {
+        writeFileSync(this.activeLabelPath, "", { encoding: "utf-8" });
+      } catch {
+        // best effort
+      }
+    }
+  }
+
+  private backupDb(): void {
+    if (!existsSync(this.dbPath)) return;
+    const backupPath = `${this.dbPath}.bak.${Date.now()}`;
+    try {
+      copyFileSync(this.dbPath, backupPath);
+    } catch {
+      // best effort; switch proceeds without a backup
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-detection
+// ---------------------------------------------------------------------------
+
+export function resolveActiveStorage(): ICredentialStorage {
+  const dbPath = getOmpAgentDbPath();
+  if (existsSync(dbPath)) {
+    try {
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        const intro = introspectCredentialsTable(db);
+        if (
+          intro.hasAuthCredentials &&
+          intro.columns.provider &&
+          intro.columns.data
+        ) {
+          const rows = db
+            .query(
+              `SELECT COUNT(*) AS cnt FROM ${quoteIdent(intro.tableName ?? "auth_credentials")} WHERE provider = ?`,
+            )
+            .all(CODEX_PROVIDER_ID) as Array<{ cnt: number }>;
+          if (rows[0] && rows[0].cnt > 0) {
+            return new OmpAgentDbStorage();
+          }
+        }
+      } finally {
+        db.close();
+      }
+    } catch {
+      // DB corrupt or locked — fall through to AuthJsonStorage
+    }
+  }
+  return new AuthJsonStorage();
+}
+
+// ---------------------------------------------------------------------------
+// Credential parsing helpers (exported for tests)
+// ---------------------------------------------------------------------------
+
+/** Safely parse a JSON data field from the DB. */
+function parseDataField(value: unknown): Record<string, unknown> {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as Record<string, unknown>;
+    } catch {
+      // fall through
+    }
+  }
+  return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -198,60 +1174,23 @@ function formatExpiry(expires: number): string {
   return `~${hours}h left`;
 }
 
-/**
- * Determine which saved label matches the credential currently in auth.json.
- * Matches on accountId first (stable), then on refresh token.
- */
-export function detectActiveLabel(
-  store: AccountsStore,
-  active: CodexCredential | undefined,
-): string | undefined {
-  if (!active) return undefined;
-  for (const [label, acct] of Object.entries(store.accounts)) {
-    const c = acct.credential;
-    if (
-      active.accountId &&
-      c.accountId &&
-      active.accountId === c.accountId
-    ) {
-      return label;
-    }
-  }
-  // Fallback: match by refresh token (account may not expose accountId).
-  for (const [label, acct] of Object.entries(store.accounts)) {
-    if (acct.credential.refresh === active.refresh) return label;
-  }
-  return store.active;
-}
-
 function summarizeAccount(label: string, acct: SavedAccount): string {
   const id = shortAccountId(acct.credential);
   const exp = formatExpiry(acct.credential.expires);
   return `${label} — ${id} (${exp})`;
 }
 
-function sortedAccountLabels(store: AccountsStore) {
-  return Object.keys(store.accounts).sort();
-}
-
-function formatAccountOption(
-  label: string,
-  account: SavedAccount,
-  activeLabel: string | undefined,
-) {
-  const marker = label === activeLabel ? "● " : "  ";
-  return marker + summarizeAccount(label, account);
-}
-
 // ---------------------------------------------------------------------------
 // Command implementations
 // ---------------------------------------------------------------------------
 
-function doList(ctx: ExtensionCommandContext): void {
-  const store = loadStore();
-  const labels = sortedAccountLabels(store);
-  const active = readActiveCodexCredential();
-  const activeLabel = detectActiveLabel(store, active);
+function doList(
+  ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
+): void {
+  const labels = storage.listLabels();
+  const active = storage.readActiveCredential();
+  const activeLabel = storage.detectActiveLabel(active);
 
   if (labels.length === 0) {
     ctx.ui.notify(
@@ -261,9 +1200,14 @@ function doList(ctx: ExtensionCommandContext): void {
     return;
   }
 
-  const lines = labels.map((label) =>
-    formatAccountOption(label, store.accounts[label]!, activeLabel),
-  );
+  const lines = labels.map((label) => {
+    const acct = storage.readAccount(label);
+    const marker = label === activeLabel ? "● " : "  ";
+    const desc = acct
+      ? summarizeAccount(label, acct)
+      : `${label} — (empty)`;
+    return marker + desc;
+  });
   ctx.ui.setWidget("codex-accounts", [
     "Codex accounts (● = active):",
     ...lines,
@@ -274,29 +1218,35 @@ function doList(ctx: ExtensionCommandContext): void {
   );
 }
 
-function doCurrent(ctx: ExtensionCommandContext): void {
-  const store = loadStore();
-  const active = readActiveCodexCredential();
+function doCurrent(
+  ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
+): void {
+  const active = storage.readActiveCredential();
   if (!active) {
     ctx.ui.notify(
-      "No openai-codex credentials in auth.json. Run /login openai-codex first.",
+      "No openai-codex credentials found. Run /login openai-codex first.",
       "warning",
     );
     return;
   }
-  const label = detectActiveLabel(store, active);
+  const label = storage.detectActiveLabel(active);
   ctx.ui.notify(
     `Active Codex account: ${label ?? "(unsaved)"} — ${shortAccountId(active)} (${formatExpiry(active.expires)}).`,
     "info",
   );
 }
 
-function doSave(ctx: ExtensionCommandContext, label: string): void {
-  if (!label) {
+function doSave(
+  ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
+  rawLabel: string,
+): void {
+  if (!rawLabel) {
     ctx.ui.notify("Usage: /codex save <label>", "warning");
     return;
   }
-  const active = readActiveCodexCredential();
+  const active = storage.readActiveCredential();
   if (!active) {
     ctx.ui.notify(
       "No openai-codex credentials to save. Run /login openai-codex first.",
@@ -304,30 +1254,29 @@ function doSave(ctx: ExtensionCommandContext, label: string): void {
     );
     return;
   }
-  const store = loadStore();
-  const existed = label in store.accounts;
-  store.accounts[label] = {
+  const existed = !!storage.readAccount(rawLabel);
+  const account: SavedAccount = {
     credential: { ...active, type: "oauth" },
     savedAt: Date.now(),
-    lastUsedAt: store.accounts[label]?.lastUsedAt,
+    lastUsedAt: storage.readAccount(rawLabel)?.lastUsedAt,
   };
-  // The thing we just saved is the active one.
-  store.active = label;
-  saveStore(store);
+
+  storage.saveAccount(rawLabel, account);
+
   ctx.ui.notify(
-    `${existed ? "Updated" : "Saved"} Codex account "${label}" — ${shortAccountId(active)}.`,
+    `${existed ? "Updated" : "Saved"} Codex account "${rawLabel}" — ${shortAccountId(active)}.`,
     "info",
   );
 }
 
 async function doSwitch(
   ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
   label: string,
 ): Promise<void> {
-  const store = loadStore();
-  const acct = store.accounts[label];
+  const acct = storage.readAccount(label);
   if (!acct) {
-    const known = sortedAccountLabels(store).join(", ") || "(none)";
+    const known = storage.listLabels().join(", ") || "(none)";
     ctx.ui.notify(
       `No saved account "${label}". Known accounts: ${known}.`,
       "warning",
@@ -335,36 +1284,20 @@ async function doSwitch(
     return;
   }
 
-  // Before clobbering auth.json, auto-snapshot the currently-active account so
-  // we don't lose its (possibly rotated) tokens.
-  const active = readActiveCodexCredential();
-  if (active) {
-    const activeLabel = detectActiveLabel(store, active);
-    if (activeLabel && store.accounts[activeLabel]) {
-      store.accounts[activeLabel] = {
-        ...store.accounts[activeLabel]!,
-        credential: { ...active, type: "oauth" },
-      };
-    }
-  }
-
-  writeActiveCodexCredential(acct.credential);
-  acct.lastUsedAt = Date.now();
-  store.active = label;
-  saveStore(store);
+  storage.switchTo(acct.credential, label);
 
   ctx.ui.notify(
     `Switched to Codex account "${label}" — ${shortAccountId(acct.credential)}. Reloading…`,
     "info",
   );
 
-  // Reload so the model registry / providers re-resolve. The next Codex API
-  // call triggers a token refresh that re-reads auth.json from disk.
+  // Reload so the model registry / providers re-resolve.
   await ctx.reload();
 }
 
 function doRename(
   ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
   from: string,
   to: string,
 ): void {
@@ -372,27 +1305,24 @@ function doRename(
     ctx.ui.notify("Usage: /codex rename <old> <new>", "warning");
     return;
   }
-  const store = loadStore();
-  if (!store.accounts[from]) {
-    ctx.ui.notify(`No saved account "${from}".`, "warning");
-    return;
+  if (storage.renameAccount(from, to)) {
+    ctx.ui.notify(`Renamed Codex account "${from}" → "${to}".`, "info");
+  } else {
+    if (!storage.readAccount(from)) {
+      ctx.ui.notify(`No saved account "${from}".`, "warning");
+    } else {
+      ctx.ui.notify(`Account "${to}" already exists.`, "warning");
+    }
   }
-  if (store.accounts[to]) {
-    ctx.ui.notify(`Account "${to}" already exists.`, "warning");
-    return;
-  }
-  store.accounts[to] = store.accounts[from]!;
-  delete store.accounts[from];
-  if (store.active === from) store.active = to;
-  saveStore(store);
-  ctx.ui.notify(`Renamed Codex account "${from}" → "${to}".`, "info");
 }
 
 async function doUsage(ctx: ExtensionCommandContext): Promise<void> {
-  const active = readActiveCodexCredential();
+  // Usage always reads from the active storage.
+  const storage = resolveActiveStorage();
+  const active = storage.readActiveCredential();
   if (!active) {
     ctx.ui.notify(
-      "No openai-codex credentials in auth.json. Run /login openai-codex first.",
+      "No openai-codex credentials found. Run /login openai-codex first.",
       "warning",
     );
     return;
@@ -406,6 +1336,7 @@ async function doUsage(ctx: ExtensionCommandContext): Promise<void> {
     return;
   }
 
+  ctx.ui.setStatus("codex-accounts-usage", undefined);
   try {
     const report = await queryCodexUsage(active, DEFAULT_USAGE_TIMEOUT_MS);
     ctx.ui.notify(formatUsageReport(report, active), "info");
@@ -413,6 +1344,105 @@ async function doUsage(ctx: ExtensionCommandContext): Promise<void> {
     ctx.ui.notify(`Unable to read Codex usage: ${errorMessage(error)}`, "error");
   }
 }
+
+function doStatus(
+  ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
+): void {
+  const desc = storage.description();
+  const active = storage.readActiveCredential();
+  const hasCreds = !!active;
+  const label = storage.detectActiveLabel(active);
+  ctx.ui.notify(
+    `Storage: ${desc}\n` +
+      `Has openai-codex: ${hasCreds ? "yes" : "no"}\n` +
+      `Saved accounts: ${storage.listLabels().length}\n` +
+      `Active label: ${label ?? "(none)"}`,
+    "info",
+  );
+}
+
+function doDebugDb(
+  ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
+): void {
+  const info = storage.debugInfo();
+  const lines: string[] = [
+    `Kind: ${info.kind}`,
+    `Path: ${info.path}`,
+    `Has openai-codex rows: ${info.hasCodexRows}`,
+    `Provider row count (openai-codex): ${info.providerRowCount}`,
+  ];
+  if (info.tables.length > 0) {
+    lines.push("", "Tables:");
+    for (const t of info.tables) {
+      lines.push(
+        `  ${t.name} (${t.columns.length} cols: ${t.columns.map((c) => `${c.name} ${c.type}`).join(", ")})`,
+      );
+    }
+  }
+  ctx.ui.notify(lines.join("\n"), "info");
+}
+
+function doRemove(
+  ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
+  label: string,
+): void {
+  if (!label) {
+    ctx.ui.notify("Usage: /codex remove <label>", "warning");
+    return;
+  }
+  if (!storage.readAccount(label)) {
+    ctx.ui.notify(`No saved account "${label}".`, "warning");
+    return;
+  }
+  storage.removeAccount(label);
+  ctx.ui.notify(
+    `Removed Codex account "${label}". (Active credential was not modified.)`,
+    "info",
+  );
+}
+
+async function doInteractive(
+  ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
+): Promise<void> {
+  const labels = storage.listLabels();
+  if (labels.length === 0) {
+    ctx.ui.notify(
+      "No saved Codex accounts yet. Log in (/login openai-codex), then run /codex save <label>.",
+      "info",
+    );
+    return;
+  }
+  const active = storage.readActiveCredential();
+  const activeLabel = storage.detectActiveLabel(active);
+
+  const options = labels.map((label) => {
+    const acct = storage.readAccount(label);
+    const marker = label === activeLabel ? "● " : "  ";
+    const desc = acct
+      ? summarizeAccount(label, acct)
+      : `${label} — (empty)`;
+    return marker + desc;
+  });
+
+  const choice = await ctx.ui.select("Switch to Codex account:", options);
+  if (!choice) return;
+  const idx = options.indexOf(choice);
+  if (idx < 0) return;
+  const label = labels[idx]!;
+  if (label === activeLabel) {
+    ctx.ui.notify(`"${label}" is already active.`, "info");
+    return;
+  }
+  await doSwitch(ctx, storage, label);
+}
+
+// ---------------------------------------------------------------------------
+// Usage reporting (unchanged from original)
+// ---------------------------------------------------------------------------
 
 export type UsageReport = {
   capturedAt: number;
@@ -430,6 +1460,7 @@ export type UsageSnapshot = {
 
 export type UsageWindow = {
   usedPercent: number;
+  windowMinutes?: number;
   resetsAt?: number;
 };
 
@@ -533,14 +1564,22 @@ function normalizeUsageSnapshot(
 ): UsageSnapshot | undefined {
   const normalizedCredits = normalizeUsageCredits(credits);
   if (rateLimit === null || rateLimit === undefined) {
-    return normalizedCredits ? { limitId, limitName, credits: normalizedCredits } : undefined;
+    return normalizedCredits
+      ? { limitId, limitName, credits: normalizedCredits }
+      : undefined;
   }
 
   const details = assertObject(rateLimit, "rate limit");
   const primary = normalizeUsageWindow(details.primary_window);
   const secondary = normalizeUsageWindow(details.secondary_window);
   if (!primary && !secondary && !normalizedCredits) return undefined;
-  return { limitId, limitName, primary, secondary, credits: normalizedCredits };
+  return {
+    limitId,
+    limitName,
+    primary,
+    secondary,
+    credits: normalizedCredits,
+  };
 }
 
 function normalizeUsageWindow(value: unknown): UsageWindow | undefined {
@@ -548,8 +1587,16 @@ function normalizeUsageWindow(value: unknown): UsageWindow | undefined {
   const window = assertObject(value, "rate-limit window");
   const usedPercent = asNumber(window.used_percent);
   if (usedPercent === undefined) return undefined;
+  const limitSeconds = asNumber(window.limit_window_seconds);
   const resetsAt = asNumber(window.reset_at);
-  return { usedPercent, resetsAt };
+  return {
+    usedPercent,
+    windowMinutes:
+      limitSeconds && limitSeconds > 0
+        ? Math.ceil(limitSeconds / 60)
+        : undefined,
+    resetsAt,
+  };
 }
 
 function normalizeUsageCredits(value: unknown): UsageCredits | undefined {
@@ -576,10 +1623,16 @@ export function formatUsageReport(
   for (const snapshot of report.snapshots) {
     const label = snapshot.limitName ?? snapshot.limitId;
     if (!isPrimaryUsageSnapshot(snapshot)) lines.push(`${label} limit:`);
-    if (snapshot.primary) lines.push(formatUsageWindowLine("5h limit:", snapshot.primary));
-    if (snapshot.secondary) lines.push(formatUsageWindowLine("Weekly limit:", snapshot.secondary));
-    if (!snapshot.primary && !snapshot.secondary) lines.push("Limits unavailable for this account");
-    if (snapshot.credits) lines.push(`Credits: ${formatCredits(snapshot.credits)}`);
+    if (snapshot.primary)
+      lines.push(formatUsageWindowLine("5h limit:", snapshot.primary));
+    if (snapshot.secondary)
+      lines.push(
+        formatUsageWindowLine("Weekly limit:", snapshot.secondary),
+      );
+    if (!snapshot.primary && !snapshot.secondary)
+      lines.push("Limits unavailable for this account");
+    if (snapshot.credits)
+      lines.push(`Credits: ${formatCredits(snapshot.credits)}`);
     lines.push("");
   }
 
@@ -587,7 +1640,10 @@ export function formatUsageReport(
 }
 
 function isPrimaryUsageSnapshot(snapshot: UsageSnapshot): boolean {
-  return normalizedUsageKey(snapshot.limitId) === "codex" || normalizedUsageKey(snapshot.limitName) === "codex";
+  return (
+    normalizedUsageKey(snapshot.limitId) === "codex" ||
+    normalizedUsageKey(snapshot.limitName) === "codex"
+  );
 }
 
 function formatUsageWindowLine(label: string, window: UsageWindow): string {
@@ -596,12 +1652,16 @@ function formatUsageWindowLine(label: string, window: UsageWindow): string {
 
 function formatUsageWindow(window: UsageWindow): string {
   const remaining = 100 - clampPercent(window.usedPercent);
-  const reset = window.resetsAt ? ` (resets ${formatReset(window.resetsAt)})` : "";
+  const reset = window.resetsAt
+    ? ` (resets ${formatReset(window.resetsAt)})`
+    : "";
   return `${progressBar(remaining)} ${remaining.toFixed(0)}% left${reset}`;
 }
 
 function progressBar(percentRemaining: number): string {
-  const filled = Math.round((clampPercent(percentRemaining) / 100) * BAR_SEGMENTS);
+  const filled = Math.round(
+    (clampPercent(percentRemaining) / 100) * BAR_SEGMENTS,
+  );
   return `[${"█".repeat(filled)}${"░".repeat(BAR_SEGMENTS - filled)}]`;
 }
 
@@ -628,16 +1688,21 @@ function formatReset(epochSeconds: number): string {
 }
 
 function formatPlanType(planType: string): string {
-  const words = planType.replace(/([a-z])([A-Z])/g, "$1 $2");
-  const key = words.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  const key = planType
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_");
   if (key === "pro_lite" || key === "prolite") return "Pro Lite";
-  if (key === "team" || key === "self_serve_business_usage_based" || key === "business") return "Business";
+  if (
+    key === "team" ||
+    key === "self_serve_business_usage_based" ||
+    key === "business"
+  )
+    return "Business";
   if (key === "enterprise_cbp_usage_based") return "Enterprise";
-  return titleCaseWords(words.replace(/[_-]+/g, " "));
-}
-
-function titleCaseWords(value: string): string {
-  return value
+  return planType
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
     .trim()
     .split(/\s+/)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
@@ -652,17 +1717,25 @@ function normalizedUsageKey(value: string | undefined): string | undefined {
   return key || undefined;
 }
 
-function parseJsonObject(text: string, description: string): Record<string, unknown> {
+function parseJsonObject(
+  text: string,
+  description: string,
+): Record<string, unknown> {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(text) as unknown;
   } catch (error) {
-    throw new Error(`${description} was not valid JSON: ${errorMessage(error)}`);
+    throw new Error(
+      `${description} was not valid JSON: ${errorMessage(error)}`,
+    );
   }
   return assertObject(parsed, description);
 }
 
-function assertObject(value: unknown, description: string): Record<string, unknown> {
+function assertObject(
+  value: unknown,
+  description: string,
+): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${description} was not an object`);
   }
@@ -688,7 +1761,9 @@ function asBoolean(value: unknown): boolean | undefined {
 
 function formatNumber(value: number, fallback: string): string {
   if (!Number.isFinite(value)) return fallback;
-  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(value);
+  return new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 2,
+  }).format(value);
 }
 
 function clampPercent(value: number): number {
@@ -700,7 +1775,10 @@ function redactErrorBody(body: string): string {
   return truncateEnd(
     body
       .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer <redacted>")
-      .replace(/"access_token"\s*:\s*"[^"]+"/gi, '"access_token":"<redacted>"')
+      .replace(
+        /"access_token"\s*:\s*"[^"]+"/gi,
+        '"access_token":"<redacted>"',
+      )
       .trim(),
     MAX_ERROR_BODY_CHARS,
   );
@@ -715,54 +1793,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function doRemove(ctx: ExtensionCommandContext, label: string): void {
-  if (!label) {
-    ctx.ui.notify("Usage: /codex remove <label>", "warning");
-    return;
-  }
-  const store = loadStore();
-  if (!store.accounts[label]) {
-    ctx.ui.notify(`No saved account "${label}".`, "warning");
-    return;
-  }
-  delete store.accounts[label];
-  if (store.active === label) store.active = undefined;
-  saveStore(store);
-  ctx.ui.notify(
-    `Removed Codex account "${label}". (auth.json was not modified.)`,
-    "info",
-  );
-}
-
-async function doInteractive(ctx: ExtensionCommandContext): Promise<void> {
-  const store = loadStore();
-  const labels = sortedAccountLabels(store);
-  if (labels.length === 0) {
-    ctx.ui.notify(
-      "No saved Codex accounts yet. Log in (/login openai-codex), then run /codex save <label>.",
-      "info",
-    );
-    return;
-  }
-  const active = readActiveCodexCredential();
-  const activeLabel = detectActiveLabel(store, active);
-
-  const options = labels.map((label) =>
-    formatAccountOption(label, store.accounts[label]!, activeLabel),
-  );
-
-  const choice = await ctx.ui.select("Switch to Codex account:", options);
-  if (!choice) return;
-  const idx = options.indexOf(choice);
-  if (idx < 0) return;
-  const label = labels[idx]!;
-  if (label === activeLabel) {
-    ctx.ui.notify(`"${label}" is already active.`, "info");
-    return;
-  }
-  await doSwitch(ctx, label);
-}
-
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
@@ -775,33 +1805,57 @@ export function tokenize(args: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// Label sanitization for filesystem safety
+// ---------------------------------------------------------------------------
+
+function sanitizeLabel(label: string): string {
+  return label.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim();
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+  const clearUsageStatuslines = (
+    ctx: ExtensionCommandContext | ExtensionContext,
+  ) => {
+    ctx.ui.setStatus("codex-accounts-usage", undefined);
+  };
+
+  pi.on("session_start", (_event, ctx) => clearUsageStatuslines(ctx));
+  pi.on("model_select", (_event, ctx) => clearUsageStatuslines(ctx));
+  pi.on("session_shutdown", (_event, ctx) => clearUsageStatuslines(ctx));
+
   const command = {
     description:
-      "Switch between multiple OpenAI Codex logins and show usage (save/switch/usage/list/current/rename/remove)",
+      "Switch between multiple OpenAI Codex logins and show usage (save/switch/usage/list/current/status/debug-db/rename/remove)",
     getArgumentCompletions: (prefix: string) => {
+      const subcommands = [
+        "list",
+        "current",
+        "save",
+        "switch",
+        "usage",
+        "status",
+        "debug-db",
+        "rename",
+        "remove",
+      ];
       const tokens = prefix.split(/\s+/);
-      // Completing the subcommand itself.
       if (tokens.length <= 1) {
-        const items = SUBCOMMANDS
+        const items = subcommands
           .filter((s) => s.startsWith(tokens[0] ?? ""))
           .map((s) => ({ value: s, label: s }));
         return items.length > 0 ? items : null;
       }
-      // Completing a label for switch/rename/remove. Pi replaces the full
-      // command argument string with the selected completion value, so include
-      // the subcommand prefix. Returning only the label would turn
-      // `/codex rename old new` into `/codex old`.
-      const sub = tokens[0] ?? "";
-      if (LABEL_COMPLETION_SUBCOMMANDS.has(sub)) {
-        // Do not complete the new name in `rename <old> <new>`; it is free text.
+      const sub = tokens[0];
+      if (sub === "switch" || sub === "remove" || sub === "rename") {
         if (sub === "rename" && tokens.length > 2) return null;
 
+        const storage = resolveActiveStorage();
         const labelPrefix = tokens[1] ?? "";
-        const labels = sortedAccountLabels(loadStore());
+        const labels = storage.listLabels();
         const items = labels
           .filter((l) => l.startsWith(labelPrefix))
           .map((l) => ({ value: `${sub} ${l}`, label: l }));
@@ -815,40 +1869,74 @@ export default function (pi: ExtensionAPI) {
 
       switch (sub) {
         case "":
-          await doInteractive(ctx);
+        {
+          const storage = resolveActiveStorage();
+          await doInteractive(ctx, storage);
           return;
+        }
         case "list":
         case "ls":
-          doList(ctx);
+        {
+          const storage = resolveActiveStorage();
+          doList(ctx, storage);
           return;
+        }
         case "current":
         case "active":
-          doCurrent(ctx);
+        {
+          const storage = resolveActiveStorage();
+          doCurrent(ctx, storage);
           return;
+        }
         case "save":
-          doSave(ctx, tokens[1] ?? "");
+        {
+          const storage = resolveActiveStorage();
+          doSave(ctx, storage, tokens[1] ?? "");
           return;
+        }
         case "switch":
         case "use":
-          await doSwitch(ctx, tokens[1] ?? "");
+        {
+          const storage = resolveActiveStorage();
+          await doSwitch(ctx, storage, tokens[1] ?? "");
           return;
+        }
         case "usage":
-        case "status":
           await doUsage(ctx);
           return;
+        case "status":
+        {
+          const storage = resolveActiveStorage();
+          doStatus(ctx, storage);
+          return;
+        }
+        case "debug-db":
+        {
+          const storage = resolveActiveStorage();
+          doDebugDb(ctx, storage);
+          return;
+        }
         case "rename":
         case "mv":
-          doRename(ctx, tokens[1] ?? "", tokens[2] ?? "");
+        {
+          const storage = resolveActiveStorage();
+          doRename(ctx, storage, tokens[1] ?? "", tokens[2] ?? "");
           return;
+        }
         case "remove":
         case "rm":
         case "delete":
-          doRemove(ctx, tokens[1] ?? "");
+        {
+          const storage = resolveActiveStorage();
+          doRemove(ctx, storage, tokens[1] ?? "");
           return;
+        }
         default:
-          // Treat a bare unknown token as a label to switch to.
-          await doSwitch(ctx, tokens[0]!);
+        {
+          const storage = resolveActiveStorage();
+          await doSwitch(ctx, storage, tokens[0]!);
           return;
+        }
       }
     },
   };
