@@ -63,6 +63,21 @@ function createOmpDb(path: string): void {
   db.close();
 }
 
+/** Credential ids this extension has parked, newest schema: a sentinel deadline. */
+function blockedIds(path: string): number[] {
+  const db = new Database(path);
+  try {
+    const rows = db
+      .query(
+        "SELECT credential_id FROM auth_credential_blocks WHERE provider_key = 'openai-codex:oauth' AND block_scope = '' AND blocked_until_ms = 4102444800000 ORDER BY credential_id",
+      )
+      .all() as Array<{ credential_id: number }>;
+    return rows.map((row) => row.credential_id);
+  } finally {
+    db.close();
+  }
+}
+
 function insertCredential(path: string, id: number, credential: CodexCredential): void {
   const db = new Database(path);
   (db.run as unknown as (query: string, ...params: unknown[]) => void)(
@@ -169,12 +184,65 @@ describe("OMP SQLite storage", () => {
     storage.importExisting();
 
     storage.switchTo(storage.readAccount("main")!.credential, "main");
-    expect(storage.listDbAccounts().filter((r) => r.disabledCause)).toHaveLength(1);
+    expect(blockedIds(dbPath)).toEqual([2]);
 
     expect(storage.unpin()).toBe(1);
-    expect(storage.listDbAccounts().filter((r) => r.disabledCause)).toHaveLength(0);
+    expect(blockedIds(dbPath)).toEqual([]);
     expect(storage.pinnedLabel()).toBeUndefined();
     expect(storage.unpin()).toBe(0);
+  });
+
+  // The regression this guards: an earlier pin parked accounts by setting
+  // `disabled_cause`, and OMP loads only rows where that column is NULL
+  // (auth/sqlite-credential-store.ts). Every other account therefore vanished
+  // from OMP's own account list the moment you switched.
+  test("a pin never disables a row, so OMP still lists every account", () => {
+    const root = tempRoot();
+    const dbPath = join(root, "agent.db");
+    createOmpDb(dbPath);
+    insertCredential(dbPath, 1, makeCredential("main"));
+    insertCredential(dbPath, 2, makeCredential("second"));
+    insertCredential(dbPath, 3, makeCredential("third"));
+    const storage = new OmpAgentDbStorage(dbPath, join(root, "accounts"));
+    storage.importExisting();
+
+    storage.switchTo(storage.readAccount("main")!.credential, "main");
+
+    const visible = new Database(dbPath);
+    const visibleToOmp = visible
+      .query(
+        "SELECT id FROM auth_credentials WHERE provider = 'openai-codex' AND disabled_cause IS NULL ORDER BY id",
+      )
+      .all() as Array<{ id: number }>;
+    visible.close();
+    expect(visibleToOmp.map((r) => r.id)).toEqual([1, 2, 3]);
+    expect(blockedIds(dbPath)).toEqual([2, 3]);
+  });
+
+  test("unpin leaves a rate-limit block OMP wrote alone", () => {
+    const root = tempRoot();
+    const dbPath = join(root, "agent.db");
+    createOmpDb(dbPath);
+    insertCredential(dbPath, 1, makeCredential("main"));
+    insertCredential(dbPath, 2, makeCredential("second"));
+    const storage = new OmpAgentDbStorage(dbPath, join(root, "accounts"));
+    storage.importExisting();
+    storage.switchTo(storage.readAccount("main")!.credential, "main");
+
+    // OMP backs off the pinned account for its own reasons.
+    const db = new Database(dbPath);
+    db.run(
+      "INSERT OR REPLACE INTO auth_credential_blocks (credential_id, provider_key, block_scope, blocked_until_ms, updated_at) VALUES (1, 'openai-codex:oauth', '', 111, 111)",
+    );
+    db.close();
+
+    expect(storage.unpin()).toBe(1);
+    const after = new Database(dbPath);
+    const left = after
+      .query("SELECT credential_id, blocked_until_ms FROM auth_credential_blocks")
+      .all() as Array<{ credential_id: number; blocked_until_ms: number }>;
+    after.close();
+    expect(left).toEqual([{ credential_id: 1, blocked_until_ms: 111 }]);
   });
 
   test("a pin never re-enables a row OMP disabled for its own reason", () => {

@@ -81,22 +81,24 @@ credential.
 
 ### How switching works on OMP
 
-OMP picks a credential per request from every non-disabled row of a provider,
-so switching does not mean "replace the login" — it means "make this one the
-only candidate". `/codex switch` parks the other rows by setting
-`disabled_cause` to a marker of its own and leaves the target running; `/codex
-unpin` clears that marker.
+OMP picks a credential per request from every account it holds for a provider
+and skips the ones that are *blocked*. So switching does not mean "replace the
+login" and it does not mean "disable the others" — it means "block everything
+else". `/codex switch` writes a far-future row into `auth_credential_blocks`
+for each other account; `/codex unpin` deletes exactly those rows.
 
 Consequences worth knowing:
 
-- **No credential is ever rewritten or deleted by a switch.** An earlier version
-  overwrote the active row in place and could destroy a login outright.
-- **A row OMP disabled for its own reason keeps its own cause** and is never
-  re-enabled by `unpin` — only rows carrying this extension's marker are.
-- **A pin releases itself** if OMP disables the pinned credential, rather than
-  stranding the session with no usable login.
-- **While pinned, OMP's automatic rotation is off** for Codex, by definition:
-  one candidate cannot be rotated. Run `/codex unpin` to get it back.
+- **Every account stays visible to OMP.** Blocked accounts are still enabled,
+  still listed, still one `/codex unpin` away from use.
+- **No credential is ever rewritten or deleted by a switch.**
+- **A genuine rate-limit block OMP wrote is never cleared by `unpin`** — only
+  blocks carrying this extension's sentinel deadline are.
+- **A pin degrades to rotation rather than failing.** If the pinned account
+  hits its own limit, OMP falls back to the first candidate in its rotation
+  order instead of erroring.
+- **While pinned, OMP's rotation is effectively off** for Codex. Run
+  `/codex unpin` to get it back.
 
 `/codex-account` is also a registered alias.
 `/codex switch` (or `/codex use`) will try to match an unknown token as a label, so `/codex personal` is a shortcut for `/codex switch personal`.

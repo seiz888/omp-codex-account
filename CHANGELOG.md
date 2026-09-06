@@ -4,6 +4,19 @@ All notable changes to `pi-codex-account` are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- **Switching no longer hides the other accounts from OMP.** The first pin
+  implementation parked accounts by writing `disabled_cause`, and OMP loads
+  only rows where that column is NULL — so every account except the pinned one
+  disappeared from OMP's own account list. Pinning now uses
+  `auth_credential_blocks` instead: selection skips a blocked credential, but
+  the row stays enabled and listed. Verified through OMP's own
+  `SqliteAuthCredentialStore`: after a pin it still lists all six accounts and
+  reports the five non-pinned ones blocked.
+- A pin left behind by the older implementation is released automatically at
+  session start, with a notification saying how many accounts came back.
+
 ### Changed
 
 - On OMP, `/codex switch` now pins instead of overwriting. It parks the other

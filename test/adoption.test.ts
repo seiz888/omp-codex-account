@@ -27,6 +27,14 @@ function seedDb(accounts: Array<{ email: string; accountId: string }>): void {
     created_at INTEGER,
     updated_at INTEGER
   )`);
+  db.run(`CREATE TABLE auth_credential_blocks (
+    credential_id INTEGER NOT NULL,
+    provider_key TEXT NOT NULL,
+    block_scope TEXT NOT NULL DEFAULT '',
+    blocked_until_ms INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (credential_id, provider_key, block_scope)
+  )`);
   for (const account of accounts) {
     db.run(
       "INSERT INTO auth_credentials (provider, credential_type, data, identity_key) VALUES (?, ?, ?, ?)",

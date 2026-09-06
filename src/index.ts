@@ -56,17 +56,30 @@ import { Database } from "bun:sqlite";
 
 const CODEX_PROVIDER_ID = "openai-codex";
 /**
- * Written into `disabled_cause` for rows this extension parks so one account is
- * the only candidate left.
+ * How this extension pins one Codex account.
  *
- * OMP picks a credential per request from every non-disabled row of a provider
- * (`auth-storage.ts#selectCredentialByType`) and short-circuits to the single
- * row when only one remains, so parking the others pins the survivor without
- * touching any credential. The marker is deliberately distinctive: only rows
- * carrying THIS exact cause are ever re-enabled, so a row OMP disabled for a
- * real reason is never silently resurrected.
+ * OMP picks a credential per request from every row of a provider
+ * (`auth-storage.ts#selectCredentialByType`) and skips candidates that are
+ * *blocked*. Blocks live in `auth_credential_blocks`, and
+ * `#getCredentialBlockedUntil` always consults the persisted block at the
+ * empty scope, so a row written there is passed over without being touched.
+ *
+ * This is deliberately NOT `disabled_cause`. OMP loads only rows with
+ * `disabled_cause IS NULL` (`auth/sqlite-credential-store.ts`), so disabling
+ * the other accounts made them vanish from OMP's own account list — the exact
+ * bug this replaces. A blocked row stays enabled, stays listed, and simply
+ * loses the draw.
+ *
+ * The far-future deadline doubles as the marker: only blocks carrying exactly
+ * this timestamp are ever removed by `unpin`, so a genuine rate-limit backoff
+ * OMP wrote is never cleared by us.
  */
-const PIN_PAUSE_CAUSE = "paused by /codex pin (pi-codex-account)";
+const PIN_BLOCK_UNTIL_MS = 4_102_444_800_000; // 2100-01-01T00:00:00Z
+/** Composite key OMP blocks Codex OAuth credentials under. */
+const CODEX_PROVIDER_KEY = `${CODEX_PROVIDER_ID}:oauth`;
+const PIN_BLOCKS_TABLE = "auth_credential_blocks";
+/** Marker written by the previous, account-hiding implementation. Cleanup only. */
+const LEGACY_PIN_PAUSE_CAUSE = "paused by /codex pin (pi-codex-account)";
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const USAGE_SETTINGS_URL = "https://chatgpt.com/codex/settings/usage";
 const DEFAULT_USAGE_TIMEOUT_MS = 15_000;
@@ -215,6 +228,13 @@ export interface ICredentialStorage {
 
   /** Releases a pin, restoring every row this extension parked. Returns the count. */
   unpin(): number;
+
+  /**
+   * Undo a pin left by the older implementation, which parked accounts by
+   * disabling them and so hid them from OMP's own account list.
+   * Returns how many accounts were handed back; 0 when there was nothing to do.
+   */
+  releaseLegacyDisabledPin(): number;
 
   /** Human-readable storage description (no tokens). */
   description(): string;
@@ -475,6 +495,11 @@ export class AuthJsonStorage implements ICredentialStorage {
 
   pinHealthy(): boolean {
     return false;
+  }
+
+  releaseLegacyDisabledPin(): number {
+    // Single-slot storage never had a pin to leave behind.
+    return 0;
   }
 
   unpin(): number {
@@ -803,73 +828,98 @@ export class OmpAgentDbStorage implements ICredentialStorage {
     return true;
   }
 
+  /** Whether this db carries the block table a pin needs. */
+  private hasBlocksTable(db: Database): boolean {
+    const row = db
+      .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(PIN_BLOCKS_TABLE) as { name?: string } | null;
+    return !!row?.name;
+  }
+
+  /** Credential ids this extension has parked, by the sentinel deadline. */
+  private pinBlockedIds(db: Database): Set<number> {
+    if (!this.hasBlocksTable(db)) return new Set();
+    const rows = db
+      .query(
+        `SELECT credential_id FROM ${PIN_BLOCKS_TABLE}
+         WHERE provider_key = ? AND block_scope = '' AND blocked_until_ms = ?`,
+      )
+      .all(CODEX_PROVIDER_KEY, PIN_BLOCK_UNTIL_MS) as Array<{ credential_id: number }>;
+    return new Set(rows.map((row) => row.credential_id));
+  }
+
+  private clearPinBlocks(db: Database): void {
+    runSql(
+      db,
+      `DELETE FROM ${PIN_BLOCKS_TABLE}
+       WHERE provider_key = ? AND block_scope = '' AND blocked_until_ms = ?`,
+      CODEX_PROVIDER_KEY,
+      PIN_BLOCK_UNTIL_MS,
+    );
+  }
+
   /**
-   * Parks every other Codex row so `accountId` is the only candidate OMP has.
+   * Parks every other Codex row so `accountId` is the one OMP selects.
    *
-   * Nothing is rewritten: only `disabled_cause` changes, and only on rows that
-   * were either free or parked by us before. A row OMP itself disabled keeps
-   * its own cause and stays disabled.
+   * No credential is rewritten and no row is disabled: the others are blocked,
+   * which keeps them enabled, listed, and one `/codex unpin` away from use.
+   * If the pinned account later hits its own limit OMP falls back to the first
+   * candidate in its rotation order rather than failing the request, so a pin
+   * degrades to rotation instead of stranding the session.
    */
   pinAccount(accountId: string): { pinnedId: number; paused: number } {
     const target = this.findRowByAccountId(accountId);
     if (!target) throw new Error(`no stored credential for account ${accountId}`);
-    if (target.disabledCause && target.disabledCause !== PIN_PAUSE_CAUSE) {
+    if (target.disabledCause) {
       throw new Error(
-        `OMP has disabled that credential (${target.disabledCause}); pinning it would leave no usable Codex login`,
+        `OMP has disabled that credential (${target.disabledCause}); pinning it would leave nothing usable`,
       );
     }
 
     const db = this.openDb();
     try {
-      const intro = introspectCredentialsTable(db);
-      if (!intro.hasAuthCredentials || !intro.columns.disabled_cause) {
-        throw new Error("this agent.db has no disabled_cause column to pin with");
+      if (!this.hasBlocksTable(db)) {
+        throw new Error(`this agent.db has no ${PIN_BLOCKS_TABLE} table to pin with`);
       }
-      const table = quoteIdent(intro.tableName ?? "auth_credentials");
       this.backupDb();
+      this.clearPinBlocks(db);
 
-      // Release the target first, so a re-pin of an already-parked row works.
-      runSql(
-        db,
-        `UPDATE ${table} SET disabled_cause = NULL
-         WHERE provider = ? AND credential_type = ? AND id = ? AND disabled_cause = ?`,
-        CODEX_PROVIDER_ID,
-        "oauth",
-        target.id,
-        PIN_PAUSE_CAUSE,
-      );
+      const others = this
+        .listDbAccounts()
+        .filter((account) => account.id !== target.id && !account.disabledCause);
+      const now = Date.now();
+      for (const other of others) {
+        runSql(
+          db,
+          `INSERT OR REPLACE INTO ${PIN_BLOCKS_TABLE}
+             (credential_id, provider_key, block_scope, blocked_until_ms, updated_at)
+           VALUES (?, ?, '', ?, ?)`,
+          other.id,
+          CODEX_PROVIDER_KEY,
+          PIN_BLOCK_UNTIL_MS,
+          now,
+        );
+      }
 
-      runSql(
-        db,
-        `UPDATE ${table} SET disabled_cause = ?
-         WHERE provider = ? AND credential_type = ? AND id != ? AND disabled_cause IS NULL`,
-        PIN_PAUSE_CAUSE,
-        CODEX_PROVIDER_ID,
-        "oauth",
-        target.id,
-      );
-
-      const paused = (
-        db
-          .query(
-            `SELECT COUNT(*) AS n FROM ${table}
-             WHERE provider = ? AND credential_type = ? AND disabled_cause = ?`,
-          )
-          .get(CODEX_PROVIDER_ID, "oauth", PIN_PAUSE_CAUSE) as { n?: number } | null
-      )?.n ?? 0;
-
-      return { pinnedId: target.id, paused };
+      return { pinnedId: target.id, paused: others.length };
     } finally {
       db.close();
     }
   }
 
-  /** The account id left running while others are parked, if a pin is active. */
+  /** The account id left unblocked while others are parked, if a pin is active. */
   pinnedAccountId(): string | undefined {
-    const accounts = this.listDbAccounts();
-    const parked = accounts.filter((a) => a.disabledCause === PIN_PAUSE_CAUSE);
-    if (parked.length === 0) return undefined;
-    const running = accounts.filter((a) => !a.disabledCause);
+    const db = this.openDb(true);
+    let blocked: Set<number>;
+    try {
+      blocked = this.pinBlockedIds(db);
+    } finally {
+      db.close();
+    }
+    if (blocked.size === 0) return undefined;
+    const running = this
+      .listDbAccounts()
+      .filter((account) => !account.disabledCause && !blocked.has(account.id));
     if (running.length !== 1) return undefined;
     const accountId = running[0]!.credential.accountId;
     return typeof accountId === "string" ? accountId : undefined;
@@ -888,19 +938,36 @@ export class OmpAgentDbStorage implements ICredentialStorage {
   unpin(): number {
     const db = this.openDb();
     try {
+      const parked = this.pinBlockedIds(db).size;
+      if (parked === 0) return 0;
+      this.backupDb();
+      this.clearPinBlocks(db);
+      return parked;
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * Clear a pin left behind by the older, destructive implementation, which
+   * parked rows by disabling them and so hid them from OMP entirely.
+   * Returns how many rows were handed back.
+   */
+  releaseLegacyDisabledPin(): number {
+    const db = this.openDb();
+    try {
       const intro = introspectCredentialsTable(db);
       if (!intro.hasAuthCredentials || !intro.columns.disabled_cause) return 0;
       const table = quoteIdent(intro.tableName ?? "auth_credentials");
-      const parked = (
+      const stuck = (
         db
           .query(
             `SELECT COUNT(*) AS n FROM ${table}
              WHERE provider = ? AND credential_type = ? AND disabled_cause = ?`,
           )
-          .get(CODEX_PROVIDER_ID, "oauth", PIN_PAUSE_CAUSE) as { n?: number } | null
+          .get(CODEX_PROVIDER_ID, "oauth", LEGACY_PIN_PAUSE_CAUSE) as { n?: number } | null
       )?.n ?? 0;
-      if (parked === 0) return 0;
-
+      if (stuck === 0) return 0;
       this.backupDb();
       runSql(
         db,
@@ -908,9 +975,9 @@ export class OmpAgentDbStorage implements ICredentialStorage {
          WHERE provider = ? AND credential_type = ? AND disabled_cause = ?`,
         CODEX_PROVIDER_ID,
         "oauth",
-        PIN_PAUSE_CAUSE,
+        LEGACY_PIN_PAUSE_CAUSE,
       );
-      return parked;
+      return stuck;
     } finally {
       db.close();
     }
@@ -2268,6 +2335,19 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     lastModelKey = modelKey(ctx);
     clearUsageStatuslines(ctx);
+    // An earlier build pinned by disabling the other rows, which hid them from
+    // OMP entirely. Hand them back on sight rather than waiting to be asked.
+    try {
+      const restored = resolveActiveStorage().releaseLegacyDisabledPin();
+      if (restored > 0) {
+        ctx.ui.notify(
+          `Released an old-style Codex pin: ${restored} account(s) were hidden from OMP and are visible again. Re-pin with /codex switch <label>.`,
+          "warning",
+        );
+      }
+    } catch {
+      // Never let start-up cleanup take down the session.
+    }
   });
 
   // A cached usage line describes the account the previous model ran on, so it
