@@ -81,6 +81,45 @@ export interface SavedAccount {
   lastUsedAt?: number;
 }
 
+export interface DbAccount {
+  /** `auth_credentials.id`, or -1 when the table has no id column. */
+  id: number;
+  credential: CodexCredential;
+  /** Non-null when OMP has disabled this row (e.g. a failed refresh). */
+  disabledCause?: string;
+}
+
+export interface ImportResult {
+  /** Labels newly written by the import. */
+  imported: string[];
+  /** Labels that already covered a host credential, left untouched. */
+  skipped: string[];
+}
+
+/**
+ * Derives a snapshot label from a credential, preferring the email local part
+ * (`work@example.com` -> `work`) and falling back to the account id.
+ */
+export function labelFromCredential(credential: CodexCredential): string {
+  const email = credential.email;
+  if (typeof email === "string" && email.includes("@")) {
+    const local = sanitizeLabel(email.slice(0, email.indexOf("@")));
+    if (local) return local;
+  }
+  const id = credential.accountId;
+  if (typeof id === "string" && id) return `account-${id.slice(0, 8)}`;
+  return "account";
+}
+
+/** Appends `-2`, `-3`, ... until the label is free. */
+export function uniqueLabel(base: string, taken: Set<string>): string {
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) {
+    const candidate = `${base}-${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
+
 export interface AccountsStore {
   /** label -> account */
   accounts: Record<string, SavedAccount>;
@@ -127,6 +166,23 @@ export interface ICredentialStorage {
 
   /** Switch active credential to the one from a saved account. */
   switchTo(credential: CodexCredential, label: string): void;
+
+  /**
+   * Credentials the host already holds that have no snapshot yet.
+   *
+   * OMP keeps every `openai-codex` login it has ever been given as its own row
+   * in `agent.db` and rotates across them by itself, so a fresh install can be
+   * holding several accounts while this extension has saved none. Returns a
+   * display string per unsaved credential (email when known).
+   */
+  listUnsaved(): string[];
+
+  /**
+   * Adopts every host credential that has no snapshot yet, labelling each from
+   * its email. Purely additive: it writes snapshot files and never touches the
+   * credentials themselves.
+   */
+  importExisting(): ImportResult;
 
   /** Human-readable storage description (no tokens). */
   description(): string;
@@ -353,6 +409,28 @@ export class AuthJsonStorage implements ICredentialStorage {
     this.saveStore(store);
   }
 
+  listUnsaved(): string[] {
+    const active = this.readActiveCredential();
+    if (!active) return [];
+    if (this.detectActiveLabel(active)) return [];
+    const email = active.email;
+    return [typeof email === "string" && email ? email : shortAccountId(active)];
+  }
+
+  importExisting(): ImportResult {
+    const active = this.readActiveCredential();
+    if (!active) return { imported: [], skipped: [] };
+    const existing = this.detectActiveLabel(active);
+    if (existing) return { imported: [], skipped: [existing] };
+    const taken = new Set(this.listLabels());
+    const label = uniqueLabel(labelFromCredential(active), taken);
+    this.saveAccount(label, {
+      credential: { ...active, type: "oauth" },
+      savedAt: Date.now(),
+    });
+    return { imported: [label], skipped: [] };
+  }
+
   description(): string {
     const authPath = this.authPath();
     return `AuthJsonStorage (auth: ${authPath}, store: ${this.storePath()})`;
@@ -406,7 +484,9 @@ export function detectActiveLabel(
   for (const [label, acct] of Object.entries(store.accounts)) {
     if (acct.credential.refresh === active.refresh) return label;
   }
-  return store.active;
+  // `store.active` is the last label written, not a verified match — see the
+  // note on OmpAgentDbStorage.detectActiveLabel.
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +635,111 @@ export class OmpAgentDbStorage implements ICredentialStorage {
     return readonly
       ? new Database(this.dbPath, { readonly: true })
       : new Database(this.dbPath);
+  }
+
+  /**
+   * Every `openai-codex` OAuth row OMP holds, oldest first.
+   *
+   * OMP does not keep a single "logged in" credential: it stores each login as
+   * its own row and picks one per request, rotating past rows it has blocked
+   * (see `auth-storage.ts#selectCredentialByType`). Enumerating them is what
+   * lets this extension see accounts the user never saved through it.
+   */
+  listDbAccounts(): DbAccount[] {
+    try {
+      const db = this.openDb(true);
+      try {
+        const intro = introspectCredentialsTable(db);
+        if (
+          !intro.hasAuthCredentials ||
+          !intro.columns.provider ||
+          !intro.columns.data
+        ) {
+          return [];
+        }
+        const rows = db
+          .query(
+            `SELECT * FROM ${quoteIdent(intro.tableName ?? "auth_credentials")}
+             WHERE provider = ? AND credential_type = ?
+             ORDER BY id ASC`,
+          )
+          .all(CODEX_PROVIDER_ID, "oauth") as Array<Record<string, unknown>>;
+
+        const accounts: DbAccount[] = [];
+        for (const row of rows) {
+          const data = parseDataField(row.data);
+          const credential = normalizedCredential(data);
+          if (!credential) continue;
+          accounts.push({
+            id: typeof row.id === "number" ? row.id : -1,
+            credential: { ...data, ...credential, type: "oauth" },
+            disabledCause:
+              typeof row.disabled_cause === "string"
+                ? row.disabled_cause
+                : undefined,
+          });
+        }
+        return accounts;
+      } finally {
+        db.close();
+      }
+    } catch {
+      return [];
+    }
+  }
+
+  /** Snapshot labels indexed by the account id they hold. */
+  private labelsByAccountId(): Map<string, string> {
+    const byAccount = new Map<string, string>();
+    for (const label of this.listLabels()) {
+      const accountId = this.readAccount(label)?.credential.accountId;
+      if (typeof accountId === "string" && accountId) {
+        byAccount.set(accountId, label);
+      }
+    }
+    return byAccount;
+  }
+
+  listUnsaved(): string[] {
+    const saved = this.labelsByAccountId();
+    const unsaved: string[] = [];
+    for (const account of this.listDbAccounts()) {
+      const accountId = account.credential.accountId;
+      if (typeof accountId === "string" && saved.has(accountId)) continue;
+      const email = account.credential.email;
+      unsaved.push(
+        typeof email === "string" && email
+          ? email
+          : shortAccountId(account.credential),
+      );
+    }
+    return unsaved;
+  }
+
+  importExisting(): ImportResult {
+    const saved = this.labelsByAccountId();
+    const taken = new Set(this.listLabels());
+    const imported: string[] = [];
+    const skipped: string[] = [];
+
+    for (const account of this.listDbAccounts()) {
+      const accountId = account.credential.accountId;
+      const existing =
+        typeof accountId === "string" ? saved.get(accountId) : undefined;
+      if (existing) {
+        skipped.push(existing);
+        continue;
+      }
+      const label = uniqueLabel(labelFromCredential(account.credential), taken);
+      taken.add(label);
+      this.saveAccount(label, {
+        credential: account.credential,
+        savedAt: Date.now(),
+      });
+      imported.push(label);
+    }
+
+    return { imported, skipped };
   }
 
   description(): string {
@@ -914,7 +1099,13 @@ export class OmpAgentDbStorage implements ICredentialStorage {
         return label;
       }
     }
-    return stored;
+    // The remembered label is a HINT, not an answer: it is rewritten on every
+    // save, so it routinely names an account other than the active one. Earlier
+    // it was returned unverified, which made `/codex current` report the wrong
+    // account and made `switchTo` treat an unlabelled credential as labelled —
+    // overwriting the wrong snapshot and losing the outgoing credential. Only a
+    // match established above counts.
+    return undefined;
   }
 
   switchTo(credential: CodexCredential, label: string): void {
@@ -923,7 +1114,13 @@ export class OmpAgentDbStorage implements ICredentialStorage {
       const intro = introspectCredentialsTable(db);
       if (!intro.hasAuthCredentials) return;
 
-      // Auto-snapshot current active credential before switching
+      // Auto-snapshot the outgoing credential before switching.
+      //
+      // The switch rewrites the active row IN PLACE, so whatever that row held
+      // is gone afterwards. Snapshotting only labelled credentials used to lose
+      // any account the user had not saved through this extension first —
+      // including every login OMP collected on its own — so an unlabelled
+      // credential is now adopted under a derived label instead of dropped.
       const currentActive = this.readActiveCredential();
       if (currentActive) {
         const activeLabel = this.detectActiveLabel(currentActive);
@@ -936,6 +1133,15 @@ export class OmpAgentDbStorage implements ICredentialStorage {
               savedAt: existing.savedAt,
             });
           }
+        } else {
+          const adopted = uniqueLabel(
+            labelFromCredential(currentActive),
+            new Set(this.listLabels()),
+          );
+          this.saveAccount(adopted, {
+            credential: { ...currentActive, type: "oauth" },
+            savedAt: Date.now(),
+          });
         }
       }
 
@@ -1175,9 +1381,26 @@ function formatExpiry(expires: number): string {
 }
 
 function summarizeAccount(label: string, acct: SavedAccount): string {
-  const id = shortAccountId(acct.credential);
+  const email = acct.credential.email;
+  const who =
+    typeof email === "string" && email ? email : shortAccountId(acct.credential);
   const exp = formatExpiry(acct.credential.expires);
-  return `${label} — ${id} (${exp})`;
+  return `${label} — ${who} (${exp})`;
+}
+
+/**
+ * Message for "nothing saved yet", which has two very different causes: the
+ * host holds no Codex login at all, or it holds several that were never
+ * adopted (the normal state on OMP, which collects logins by itself).
+ */
+function emptyStateMessage(storage: ICredentialStorage): string {
+  const unsaved = storage.listUnsaved();
+  if (unsaved.length === 0) {
+    return "No saved Codex accounts, and none found in the credential store. Log in with /login openai-codex, then run /codex save <label>.";
+  }
+  const shown = unsaved.slice(0, 6).join(", ");
+  const more = unsaved.length > 6 ? `, +${unsaved.length - 6} more` : "";
+  return `${unsaved.length} Codex account(s) already in the credential store but not saved here: ${shown}${more}. Run /codex import to adopt them.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,7 +1417,7 @@ function doList(
 
   if (labels.length === 0) {
     ctx.ui.notify(
-      "No saved Codex accounts. Use /codex save <label> while logged in.",
+      emptyStateMessage(storage),
       "info",
     );
     return;
@@ -1214,6 +1437,35 @@ function doList(
   ]);
   ctx.ui.notify(
     `${labels.length} saved Codex account(s). Active: ${activeLabel ?? "unknown"}.`,
+    "info",
+  );
+}
+
+function doImport(
+  ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
+): void {
+  const { imported, skipped } = storage.importExisting();
+
+  if (imported.length === 0) {
+    ctx.ui.notify(
+      skipped.length > 0
+        ? `Nothing to import — all ${skipped.length} stored credential(s) are already saved.`
+        : "Nothing to import: the credential store holds no Codex login.",
+      "info",
+    );
+    return;
+  }
+
+  ctx.ui.setWidget("codex-accounts", [
+    `Imported ${imported.length} Codex account(s):`,
+    ...imported.map((label) => {
+      const acct = storage.readAccount(label);
+      return "  " + (acct ? summarizeAccount(label, acct) : label);
+    }),
+  ]);
+  ctx.ui.notify(
+    `Imported ${imported.length} account(s)${skipped.length > 0 ? `, ${skipped.length} already saved` : ""}. Switch with /codex switch <label>.`,
     "info",
   );
 }
@@ -1411,7 +1663,7 @@ async function doInteractive(
   const labels = storage.listLabels();
   if (labels.length === 0) {
     ctx.ui.notify(
-      "No saved Codex accounts yet. Log in (/login openai-codex), then run /codex save <label>.",
+      emptyStateMessage(storage),
       "info",
     );
     return;
@@ -1888,13 +2140,14 @@ export default function (pi: ExtensionAPI) {
 
   const command = {
     description:
-      "Switch between multiple OpenAI Codex logins and show usage (save/switch/usage/list/current/status/debug-db/rename/remove)",
+      "Switch between multiple OpenAI Codex logins and show usage (import/save/switch/usage/list/current/status/debug-db/rename/remove)",
     getArgumentCompletions: (prefix: string) => {
       const subcommands = [
         "list",
         "current",
         "save",
         "switch",
+        "import",
         "usage",
         "status",
         "debug-db",
@@ -1958,6 +2211,13 @@ export default function (pi: ExtensionAPI) {
         {
           const storage = resolveActiveStorage();
           await doSwitch(ctx, storage, tokens[1] ?? "");
+          return;
+        }
+        case "import":
+        case "adopt":
+        {
+          const storage = resolveActiveStorage();
+          doImport(ctx, storage);
           return;
         }
         case "usage":

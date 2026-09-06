@@ -6,6 +6,32 @@ All notable changes to `pi-codex-account` are documented in this file.
 
 ### Fixed
 
+- Switching accounts could destroy a credential. The switch rewrites the active
+  `agent.db` row in place, but the outgoing credential was only snapshotted when
+  it already carried a label — so any login the user had not saved through this
+  extension, including every one OMP collected by itself, was overwritten with
+  no copy anywhere. An unlabelled credential is now adopted under a label
+  derived from its email before the row is rewritten.
+- `detectActiveLabel` returned the remembered `active-label` even when it did
+  not match the active credential. Since that file is rewritten on every save,
+  it routinely named the wrong account: `/codex current` reported the wrong
+  login, and the switch above treated an unlabelled credential as labelled,
+  which is what defeated its own auto-snapshot. Only a verified match is
+  reported now.
+
+### Added
+
+- `/codex import` (alias `/codex adopt`) adopts every Codex credential the host
+  already holds, labelling each from its email. On OMP this turns a bare
+  `/codex list` into the full set of logins immediately, with no re-login. It
+  writes snapshot files only and is idempotent.
+- The "no saved accounts" message now distinguishes an empty credential store
+  from one holding accounts that were never adopted, and names them.
+- `/codex list` and the picker show the account email instead of only a
+  truncated account id.
+
+### Fixed
+
 - The `model_select` handler that cleared a stale usage statusline never fired
   under OMP. `model_select` is a legacy-Pi event that OMP does not emit, and
   `ExtensionAPI.on` accepts any event name at runtime on both hosts, so the

@@ -58,8 +58,16 @@ After installing or updating, reload the agent:
 
 Use `/codex` without arguments to open the interactive account picker.
 
+**On OMP, run `/codex import` first.** OMP stores every `openai-codex` login it
+has been given as its own row in `agent.db` and picks one per request, rotating
+past rows it has blocked. Those accounts are real and already in use, but they
+were never saved through this extension, so `/codex list` starts empty. `import`
+adopts them all in one step — it only writes snapshot files and never modifies a
+credential.
+
 | Command | What it does |
 |---|---|
+| `/codex import` | Adopt every Codex login already in the credential store, labelled by email. Start here on OMP. |
 | `/codex save <label>` | Save the current Codex login under a label. |
 | `/codex switch <label>` | Switch to a saved login and reload the agent. |
 | `/codex list` | List all saved logins. |
@@ -78,6 +86,9 @@ Short aliases: `ls` = `list`, `mv` = `rename`, `rm`/`delete` = `remove`, `active
 ## Typical flow — two accounts
 
 ```text
+/codex import         ← adopt logins OMP already holds
+/codex list           ← they are all there, labelled by email
+
 /login openai-codex
 /codex save work
 
