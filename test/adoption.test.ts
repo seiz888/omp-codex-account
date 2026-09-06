@@ -197,3 +197,30 @@ describe("detectActiveLabel", () => {
     expect(s.detectActiveLabel(s.readActiveCredential())).toBe("active");
   });
 });
+
+describe("pin health", () => {
+  test("a pin whose target OMP disabled is not reported healthy", () => {
+    seedDb([
+      { email: "pinned@example.com", accountId: "acct-pinned" },
+      { email: "other@example.com", accountId: "acct-other" },
+    ]);
+    const s = storage();
+    s.importExisting();
+    s.switchTo(s.readAccount("pinned")!.credential, "pinned");
+    expect(s.pinHealthy()).toBe(true);
+
+    // OMP disables the pinned credential (rate limit, refresh failure): the
+    // session would otherwise be left with no Codex login at all.
+    const db = new Database(dbPath);
+    db.run("UPDATE auth_credentials SET disabled_cause = ? WHERE identity_key LIKE ?", [
+      "rate limited",
+      "%acct-pinned%",
+    ]);
+    db.close();
+
+    expect(s.pinHealthy()).toBe(false);
+    expect(s.unpin()).toBe(1);
+    const enabled = s.listDbAccounts().filter((r) => !r.disabledCause);
+    expect(enabled.map((r) => r.credential.accountId)).toEqual(["acct-other"]);
+  });
+});

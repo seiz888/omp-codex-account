@@ -119,7 +119,7 @@ describe("storage auto-detection", () => {
 });
 
 describe("OMP SQLite storage", () => {
-  test("save then switch restores snapshots through the active database row", () => {
+  test("switching pins the target row and destroys nothing", () => {
     const root = tempRoot();
     const dbPath = join(root, "agent.db");
     const accountsDir = join(root, "accounts");
@@ -135,15 +135,85 @@ describe("OMP SQLite storage", () => {
 
     storage.switchTo(storage.readAccount("main")!.credential, "main");
     expect(storage.readActiveCredential()!.accountId).toBe(main.accountId);
-    expect(activeData(dbPath).refresh).toBe(main.refresh);
+    expect(storage.pinnedLabel()).toBe("main");
+
+    // The point of pinning: the row that is not in use still holds its own
+    // credential, untouched. Under the previous overwrite-in-place switch this
+    // credential was gone.
+    const rows = storage.listDbAccounts();
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.credential.accountId === fallback.accountId)?.credential.refresh)
+      .toBe(fallback.refresh);
+    expect(rows.find((r) => r.credential.accountId === main.accountId)?.credential.refresh)
+      .toBe(main.refresh);
 
     storage.switchTo(storage.readAccount("fallback")!.credential, "fallback");
     expect(storage.readActiveCredential()!.accountId).toBe(fallback.accountId);
-    expect(activeData(dbPath).refresh).toBe(fallback.refresh);
+    expect(storage.pinnedLabel()).toBe("fallback");
+    expect(storage.listDbAccounts()).toHaveLength(2);
 
     const snapshot = JSON.parse(readFileSync(join(accountsDir, "main.json"), "utf-8"));
     expect(snapshot.row.data.refresh).toBe(main.refresh);
     expect(snapshot.row.data.email).toBe(main.email);
+  });
+
+  test("unpin restores every row the pin parked", () => {
+    const root = tempRoot();
+    const dbPath = join(root, "agent.db");
+    createOmpDb(dbPath);
+    const main = makeCredential("main");
+    const fallback = makeCredential("fallback");
+    insertCredential(dbPath, 1, main);
+    insertCredential(dbPath, 2, fallback);
+    const storage = new OmpAgentDbStorage(dbPath, join(root, "accounts"));
+    storage.importExisting();
+
+    storage.switchTo(storage.readAccount("main")!.credential, "main");
+    expect(storage.listDbAccounts().filter((r) => r.disabledCause)).toHaveLength(1);
+
+    expect(storage.unpin()).toBe(1);
+    expect(storage.listDbAccounts().filter((r) => r.disabledCause)).toHaveLength(0);
+    expect(storage.pinnedLabel()).toBeUndefined();
+    expect(storage.unpin()).toBe(0);
+  });
+
+  test("a pin never re-enables a row OMP disabled for its own reason", () => {
+    const root = tempRoot();
+    const dbPath = join(root, "agent.db");
+    createOmpDb(dbPath);
+    const main = makeCredential("main");
+    const broken = makeCredential("broken");
+    insertCredential(dbPath, 1, main);
+    insertCredential(dbPath, 2, broken);
+
+    const db = new Database(dbPath);
+    db.run("UPDATE auth_credentials SET disabled_cause = ? WHERE id = 2", ["refresh failed"]);
+    db.close();
+
+    const storage = new OmpAgentDbStorage(dbPath, join(root, "accounts"));
+    storage.importExisting();
+    storage.switchTo(storage.readAccount("main")!.credential, "main");
+    storage.unpin();
+
+    const stillDisabled = storage
+      .listDbAccounts()
+      .find((r) => r.credential.accountId === broken.accountId);
+    expect(stillDisabled?.disabledCause).toBe("refresh failed");
+  });
+
+  test("pinning a credential OMP disabled is refused", () => {
+    const root = tempRoot();
+    const dbPath = join(root, "agent.db");
+    createOmpDb(dbPath);
+    const only = makeCredential("only");
+    insertCredential(dbPath, 1, only);
+
+    const db = new Database(dbPath);
+    db.run("UPDATE auth_credentials SET disabled_cause = ? WHERE id = 1", ["refresh failed"]);
+    db.close();
+
+    const storage = new OmpAgentDbStorage(dbPath, join(root, "accounts"));
+    expect(() => storage.pinAccount(only.accountId!)).toThrow(/disabled/);
   });
 });
 

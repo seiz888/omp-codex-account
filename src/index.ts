@@ -55,6 +55,18 @@ import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 
 const CODEX_PROVIDER_ID = "openai-codex";
+/**
+ * Written into `disabled_cause` for rows this extension parks so one account is
+ * the only candidate left.
+ *
+ * OMP picks a credential per request from every non-disabled row of a provider
+ * (`auth-storage.ts#selectCredentialByType`) and short-circuits to the single
+ * row when only one remains, so parking the others pins the survivor without
+ * touching any credential. The marker is deliberately distinctive: only rows
+ * carrying THIS exact cause are ever re-enabled, so a row OMP disabled for a
+ * real reason is never silently resurrected.
+ */
+const PIN_PAUSE_CAUSE = "paused by /codex pin (pi-codex-account)";
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const USAGE_SETTINGS_URL = "https://chatgpt.com/codex/settings/usage";
 const DEFAULT_USAGE_TIMEOUT_MS = 15_000;
@@ -183,6 +195,26 @@ export interface ICredentialStorage {
    * credentials themselves.
    */
   importExisting(): ImportResult;
+
+  /**
+   * Whether this backend can pin an account without rewriting credentials.
+   * True for OMP, whose store holds every login as its own row; false for the
+   * legacy JSON backend, which has a single credential slot.
+   */
+  supportsPinning(): boolean;
+
+  /** Label of the currently pinned account, if one is pinned. */
+  pinnedLabel(): string | undefined;
+
+  /**
+   * Whether a pin is active AND its target is still usable. False both when
+   * nothing is pinned and when the pinned credential has since been disabled —
+   * the second case is a session with no Codex login left.
+   */
+  pinHealthy(): boolean;
+
+  /** Releases a pin, restoring every row this extension parked. Returns the count. */
+  unpin(): number;
 
   /** Human-readable storage description (no tokens). */
   description(): string;
@@ -429,6 +461,24 @@ export class AuthJsonStorage implements ICredentialStorage {
       savedAt: Date.now(),
     });
     return { imported: [label], skipped: [] };
+  }
+
+  supportsPinning(): boolean {
+    // The legacy store keeps a single active credential, so there is nothing
+    // to pin against: switching necessarily rewrites that one slot.
+    return false;
+  }
+
+  pinnedLabel(): string | undefined {
+    return undefined;
+  }
+
+  pinHealthy(): boolean {
+    return false;
+  }
+
+  unpin(): number {
+    return 0;
   }
 
   description(): string {
@@ -740,6 +790,130 @@ export class OmpAgentDbStorage implements ICredentialStorage {
     }
 
     return { imported, skipped };
+  }
+
+  /** The `auth_credentials` row holding a given account id, if any. */
+  private findRowByAccountId(accountId: string): DbAccount | undefined {
+    return this.listDbAccounts().find(
+      (account) => account.credential.accountId === accountId,
+    );
+  }
+
+  supportsPinning(): boolean {
+    return true;
+  }
+
+  /**
+   * Parks every other Codex row so `accountId` is the only candidate OMP has.
+   *
+   * Nothing is rewritten: only `disabled_cause` changes, and only on rows that
+   * were either free or parked by us before. A row OMP itself disabled keeps
+   * its own cause and stays disabled.
+   */
+  pinAccount(accountId: string): { pinnedId: number; paused: number } {
+    const target = this.findRowByAccountId(accountId);
+    if (!target) throw new Error(`no stored credential for account ${accountId}`);
+    if (target.disabledCause && target.disabledCause !== PIN_PAUSE_CAUSE) {
+      throw new Error(
+        `OMP has disabled that credential (${target.disabledCause}); pinning it would leave no usable Codex login`,
+      );
+    }
+
+    const db = this.openDb();
+    try {
+      const intro = introspectCredentialsTable(db);
+      if (!intro.hasAuthCredentials || !intro.columns.disabled_cause) {
+        throw new Error("this agent.db has no disabled_cause column to pin with");
+      }
+      const table = quoteIdent(intro.tableName ?? "auth_credentials");
+      this.backupDb();
+
+      // Release the target first, so a re-pin of an already-parked row works.
+      runSql(
+        db,
+        `UPDATE ${table} SET disabled_cause = NULL
+         WHERE provider = ? AND credential_type = ? AND id = ? AND disabled_cause = ?`,
+        CODEX_PROVIDER_ID,
+        "oauth",
+        target.id,
+        PIN_PAUSE_CAUSE,
+      );
+
+      runSql(
+        db,
+        `UPDATE ${table} SET disabled_cause = ?
+         WHERE provider = ? AND credential_type = ? AND id != ? AND disabled_cause IS NULL`,
+        PIN_PAUSE_CAUSE,
+        CODEX_PROVIDER_ID,
+        "oauth",
+        target.id,
+      );
+
+      const paused = (
+        db
+          .query(
+            `SELECT COUNT(*) AS n FROM ${table}
+             WHERE provider = ? AND credential_type = ? AND disabled_cause = ?`,
+          )
+          .get(CODEX_PROVIDER_ID, "oauth", PIN_PAUSE_CAUSE) as { n?: number } | null
+      )?.n ?? 0;
+
+      return { pinnedId: target.id, paused };
+    } finally {
+      db.close();
+    }
+  }
+
+  /** The account id left running while others are parked, if a pin is active. */
+  pinnedAccountId(): string | undefined {
+    const accounts = this.listDbAccounts();
+    const parked = accounts.filter((a) => a.disabledCause === PIN_PAUSE_CAUSE);
+    if (parked.length === 0) return undefined;
+    const running = accounts.filter((a) => !a.disabledCause);
+    if (running.length !== 1) return undefined;
+    const accountId = running[0]!.credential.accountId;
+    return typeof accountId === "string" ? accountId : undefined;
+  }
+
+  pinnedLabel(): string | undefined {
+    const accountId = this.pinnedAccountId();
+    if (!accountId) return undefined;
+    return this.labelsByAccountId().get(accountId);
+  }
+
+  pinHealthy(): boolean {
+    return this.pinnedAccountId() !== undefined;
+  }
+
+  unpin(): number {
+    const db = this.openDb();
+    try {
+      const intro = introspectCredentialsTable(db);
+      if (!intro.hasAuthCredentials || !intro.columns.disabled_cause) return 0;
+      const table = quoteIdent(intro.tableName ?? "auth_credentials");
+      const parked = (
+        db
+          .query(
+            `SELECT COUNT(*) AS n FROM ${table}
+             WHERE provider = ? AND credential_type = ? AND disabled_cause = ?`,
+          )
+          .get(CODEX_PROVIDER_ID, "oauth", PIN_PAUSE_CAUSE) as { n?: number } | null
+      )?.n ?? 0;
+      if (parked === 0) return 0;
+
+      this.backupDb();
+      runSql(
+        db,
+        `UPDATE ${table} SET disabled_cause = NULL
+         WHERE provider = ? AND credential_type = ? AND disabled_cause = ?`,
+        CODEX_PROVIDER_ID,
+        "oauth",
+        PIN_PAUSE_CAUSE,
+      );
+      return parked;
+    } finally {
+      db.close();
+    }
   }
 
   description(): string {
@@ -1108,123 +1282,75 @@ export class OmpAgentDbStorage implements ICredentialStorage {
     return undefined;
   }
 
+  /**
+   * Makes `label` the account OMP uses — by pinning, never by overwriting.
+   *
+   * The previous implementation rewrote the active row in place, which
+   * destroyed whatever credential that row held. OMP stores each login as its
+   * own row and selects among the non-disabled ones per request, so the switch
+   * instead parks the other rows and leaves the target as the only candidate.
+   * Every credential survives, and `unpin()` puts things back.
+   *
+   * A snapshot with no row of its own (restored from a backup, or carried over
+   * from the legacy JSON store) is INSERTED as a new row rather than written
+   * over an existing one, then pinned like any other.
+   */
   switchTo(credential: CodexCredential, label: string): void {
-    const db = this.openDb();
-    try {
-      const intro = introspectCredentialsTable(db);
-      if (!intro.hasAuthCredentials) return;
+    const accountId = credential.accountId;
 
-      // Auto-snapshot the outgoing credential before switching.
-      //
-      // The switch rewrites the active row IN PLACE, so whatever that row held
-      // is gone afterwards. Snapshotting only labelled credentials used to lose
-      // any account the user had not saved through this extension first —
-      // including every login OMP collected on its own — so an unlabelled
-      // credential is now adopted under a derived label instead of dropped.
-      const currentActive = this.readActiveCredential();
-      if (currentActive) {
-        const activeLabel = this.detectActiveLabel(currentActive);
-        if (activeLabel) {
-          const existing = this.readAccount(activeLabel);
-          if (existing) {
-            this.saveAccount(activeLabel, {
-              ...existing,
-              credential: { ...currentActive, type: "oauth" },
-              savedAt: existing.savedAt,
-            });
-          }
-        } else {
-          const adopted = uniqueLabel(
-            labelFromCredential(currentActive),
-            new Set(this.listLabels()),
-          );
-          this.saveAccount(adopted, {
-            credential: { ...currentActive, type: "oauth" },
-            savedAt: Date.now(),
-          });
-        }
-      }
+    // Adopt whatever is running now, so a pin is never the reason an
+    // un-snapshotted credential becomes unreachable.
+    const currentActive = this.readActiveCredential();
+    if (currentActive && !this.detectActiveLabel(currentActive)) {
+      const adopted = uniqueLabel(
+        labelFromCredential(currentActive),
+        new Set(this.listLabels()),
+      );
+      this.saveAccount(adopted, {
+        credential: { ...currentActive, type: "oauth" },
+        savedAt: Date.now(),
+      });
+    }
 
-      this.backupDb();
+    let targetId =
+      typeof accountId === "string"
+        ? this.findRowByAccountId(accountId)?.id
+        : undefined;
 
-      // Find the currently active row and update its fields from the snapshot
-      const snapshot = this.readSnapshot(label);
-      if (!snapshot) return;
-
-      const found = this.findActiveRow(db);
-      if (!found) {
+    if (targetId === undefined) {
+      const db = this.openDb();
+      try {
+        const intro = introspectCredentialsTable(db);
+        if (!intro.hasAuthCredentials) return;
+        this.backupDb();
         runSql(
           db,
           `INSERT INTO ${quoteIdent(intro.tableName ?? "auth_credentials")} (provider, credential_type, data, identity_key)
            VALUES (?, ?, ?, ?)`,
           CODEX_PROVIDER_ID,
           "oauth",
-          JSON.stringify({
-            ...credential,
-            type: "oauth",
-            expires: 0,
-          }),
-          credential.accountId
-            ? `account:${credential.accountId}`
+          JSON.stringify({ ...credential, type: "oauth" }),
+          typeof accountId === "string" && accountId
+            ? `account:${accountId}`
             : null,
         );
-      } else {
-        const mergedData = {
-          ...snapshot.row.data,
-          access: credential.access,
-          refresh: credential.refresh,
-          expires: credential.expires,
-          accountId: credential.accountId,
-          type: "oauth",
-        };
-
-        const updates: string[] = [];
-        const params: unknown[] = [];
-
-        if (intro.columns.provider) {
-          updates.push("provider = ?");
-          params.push(CODEX_PROVIDER_ID);
-        }
-        if (intro.columns.credential_type) {
-          updates.push("credential_type = ?");
-          params.push("oauth");
-        }
-        if (intro.columns.data) {
-          updates.push("data = ?");
-          params.push(JSON.stringify(mergedData));
-        }
-        if (intro.columns.identity_key) {
-          updates.push("identity_key = ?");
-          params.push(
-            credential.accountId
-              ? `account:${credential.accountId}`
-              : null,
-          );
-        }
-        if (intro.columns.disabled_cause) {
-          updates.push("disabled_cause = ?");
-          params.push(snapshot.row.disabled_cause);
-        }
-        if (intro.columns.updated_at) {
-          updates.push("updated_at = CAST(strftime('%s','now') AS INTEGER)");
-        }
-
-        if (intro.columns.id) {
-          params.push(found.id);
-          runSql(
-            db,
-            `UPDATE ${quoteIdent(intro.tableName ?? "auth_credentials")} SET ${updates.join(", ")} WHERE id = ?`,
-            ...params,
-          );
-        }
+      } finally {
+        db.close();
       }
-    } finally {
-      db.close();
+      targetId =
+        typeof accountId === "string"
+          ? this.findRowByAccountId(accountId)?.id
+          : undefined;
+      if (targetId === undefined) return;
     }
+
+    const pinTarget = this.listDbAccounts().find((a) => a.id === targetId);
+    const pinAccountId = pinTarget?.credential.accountId;
+    if (typeof pinAccountId !== "string") return;
+    this.pinAccount(pinAccountId);
 
     this.writeActiveLabel(label);
 
-    // Update the snapshot's lastUsedAt
     const existingSnapshot = this.readSnapshot(label);
     if (existingSnapshot) {
       existingSnapshot.lastUsedAt = Date.now();
@@ -1431,8 +1557,11 @@ function doList(
       : `${label} — (empty)`;
     return marker + desc;
   });
+  const pinned = storage.pinnedLabel();
   ctx.ui.setWidget("codex-accounts", [
-    "Codex accounts (● = active):",
+    pinned
+      ? `Codex accounts (● = active, pinned to "${pinned}" — /codex unpin to rotate again):`
+      : "Codex accounts (● = active, OMP rotates across them):",
     ...lines,
   ]);
   ctx.ui.notify(
@@ -1468,6 +1597,29 @@ function doImport(
     `Imported ${imported.length} account(s)${skipped.length > 0 ? `, ${skipped.length} already saved` : ""}. Switch with /codex switch <label>.`,
     "info",
   );
+}
+
+async function doUnpin(
+  ctx: ExtensionCommandContext,
+  storage: ICredentialStorage,
+): Promise<void> {
+  if (!storage.supportsPinning()) {
+    ctx.ui.notify(
+      "This credential store has a single active slot, so there is no pin to release.",
+      "info",
+    );
+    return;
+  }
+  const restored = storage.unpin();
+  if (restored === 0) {
+    ctx.ui.notify("No pin is active — every Codex account is already in play.", "info");
+    return;
+  }
+  ctx.ui.notify(
+    `Released the pin: ${restored} account(s) back in play. OMP will rotate across them again. Reloading…`,
+    "info",
+  );
+  await ctx.reload();
 }
 
 function doCurrent(
@@ -1538,8 +1690,11 @@ async function doSwitch(
 
   storage.switchTo(acct.credential, label);
 
+  const pinned = storage.pinnedLabel();
   ctx.ui.notify(
-    `Switched to Codex account "${label}" — ${shortAccountId(acct.credential)}. Reloading…`,
+    storage.supportsPinning() && pinned === label
+      ? `Pinned Codex account "${label}" — ${acct.credential.email ?? shortAccountId(acct.credential)}. Other accounts are paused, not deleted; /codex unpin restores them. Reloading…`
+      : `Switched to Codex account "${label}" — ${acct.credential.email ?? shortAccountId(acct.credential)}. Reloading…`,
     "info",
   );
 
@@ -2133,20 +2288,42 @@ export default function (pi: ExtensionAPI) {
   // failure) invalidates whatever usage we last displayed for it.
   onHostEvent("credential_disabled", (event, ctx) => {
     const provider = (event as { provider?: unknown } | null)?.provider;
-    if (provider === CODEX_PROVIDER_ID) clearUsageStatuslines(ctx);
+    if (provider !== CODEX_PROVIDER_ID) return;
+    clearUsageStatuslines(ctx);
+
+    // A pin leaves exactly one Codex credential in play. If OMP has just
+    // disabled that one, the pin would strand the session with no usable login
+    // at all, so release it and let OMP rotate again rather than fail every
+    // request. Deliberately silent about which account took over: the point is
+    // that work continues.
+    try {
+      const storage = resolveActiveStorage();
+      if (!storage.supportsPinning()) return;
+      if (storage.pinHealthy()) return; // the pinned account still works
+      const restored = storage.unpin();
+      if (restored > 0) {
+        ctx.ui.notify(
+          `The pinned Codex account was disabled by OMP; released the pin and put ${restored} account(s) back in play.`,
+          "warning",
+        );
+      }
+    } catch {
+      // Never let a credential event take down the session.
+    }
   });
 
   pi.on("session_shutdown", (_event, ctx) => clearUsageStatuslines(ctx));
 
   const command = {
     description:
-      "Switch between multiple OpenAI Codex logins and show usage (import/save/switch/usage/list/current/status/debug-db/rename/remove)",
+      "Switch between multiple OpenAI Codex logins and show usage (import/save/switch/unpin/usage/list/current/status/debug-db/rename/remove)",
     getArgumentCompletions: (prefix: string) => {
       const subcommands = [
         "list",
         "current",
         "save",
         "switch",
+        "unpin",
         "import",
         "usage",
         "status",
@@ -2211,6 +2388,13 @@ export default function (pi: ExtensionAPI) {
         {
           const storage = resolveActiveStorage();
           await doSwitch(ctx, storage, tokens[1] ?? "");
+          return;
+        }
+        case "unpin":
+        case "release":
+        {
+          const storage = resolveActiveStorage();
+          await doUnpin(ctx, storage);
           return;
         }
         case "import":

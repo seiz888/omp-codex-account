@@ -4,6 +4,23 @@ All notable changes to `pi-codex-account` are documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- On OMP, `/codex switch` now pins instead of overwriting. It parks the other
+  `openai-codex` rows with a marker of its own and leaves the target as OMP's
+  only candidate, so every credential survives a switch. A snapshot with no row
+  of its own is inserted as a new row rather than written over an existing one,
+  which removes the last path that could overwrite a credential.
+
+### Added
+
+- `/codex unpin` (alias `/codex release`) clears the pin and lets OMP rotate
+  across every account again. It restores only rows this extension parked: one
+  OMP disabled for its own reason keeps its cause.
+- A pin releases itself when OMP disables the pinned credential, so a rate limit
+  on the pinned account cannot strand the session without a usable login.
+- `/codex list` says whether a pin is active and which account holds it.
+
 ### Fixed
 
 - Switching accounts could destroy a credential. The switch rewrites the active

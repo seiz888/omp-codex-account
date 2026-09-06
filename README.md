@@ -69,7 +69,8 @@ credential.
 |---|---|
 | `/codex import` | Adopt every Codex login already in the credential store, labelled by email. Start here on OMP. |
 | `/codex save <label>` | Save the current Codex login under a label. |
-| `/codex switch <label>` | Switch to a saved login and reload the agent. |
+| `/codex switch <label>` | Pin a saved login and reload the agent. On OMP the other accounts are paused, never overwritten. |
+| `/codex unpin` | Release the pin and let OMP rotate across every account again. |
 | `/codex list` | List all saved logins. |
 | `/codex current` | Show the active (in-use) login. |
 | `/codex usage` | Query usage for the active login from ChatGPT's usage endpoint. |
@@ -77,6 +78,25 @@ credential.
 | `/codex debug-db` | Inspect internal credential rows in the OMP agent database. |
 | `/codex rename <old> <new>` | Rename a saved login. |
 | `/codex remove <label>` | Delete a saved login. |
+
+### How switching works on OMP
+
+OMP picks a credential per request from every non-disabled row of a provider,
+so switching does not mean "replace the login" — it means "make this one the
+only candidate". `/codex switch` parks the other rows by setting
+`disabled_cause` to a marker of its own and leaves the target running; `/codex
+unpin` clears that marker.
+
+Consequences worth knowing:
+
+- **No credential is ever rewritten or deleted by a switch.** An earlier version
+  overwrote the active row in place and could destroy a login outright.
+- **A row OMP disabled for its own reason keeps its own cause** and is never
+  re-enabled by `unpin` — only rows carrying this extension's marker are.
+- **A pin releases itself** if OMP disables the pinned credential, rather than
+  stranding the session with no usable login.
+- **While pinned, OMP's automatic rotation is off** for Codex, by definition:
+  one candidate cannot be rotated. Run `/codex unpin` to get it back.
 
 `/codex-account` is also a registered alias.
 `/codex switch` (or `/codex use`) will try to match an unknown token as a label, so `/codex personal` is a shortcut for `/codex switch personal`.
