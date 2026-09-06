@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@earendil-works/pi-coding-agent": [
+        "./node_modules/@oh-my-pi/pi-coding-agent/dist/types/extensibility/extensions/types.d.ts"
+      ]
+    }
+  }
+}

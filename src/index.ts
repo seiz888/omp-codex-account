@@ -1823,8 +1823,67 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("codex-accounts-usage", undefined);
   };
 
-  pi.on("session_start", (_event, ctx) => clearUsageStatuslines(ctx));
-  pi.on("model_select", (_event, ctx) => clearUsageStatuslines(ctx));
+  /**
+   * Registers an event that only one of the two hosts emits.
+   *
+   * OMP and legacy Pi expose different event unions: `model_select` is Pi-only
+   * (OMP dropped it), `credential_disabled` is OMP-only. At runtime both hosts
+   * implement `on` as a permissive `on(event: string, handler)` that files the
+   * handler under a key the host may simply never emit — no error, no warning.
+   * The typed overloads, however, each reject the other host's event name, so
+   * the cast is confined here rather than spread across call sites.
+   */
+  const onHostEvent = (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void,
+  ) => {
+    (
+      pi.on as unknown as (
+        event: string,
+        handler: (event: unknown, ctx: ExtensionContext) => void,
+      ) => void
+    )(event, handler);
+  };
+
+  /** Stable identity for "did the active model change?" comparisons. */
+  const modelKey = (ctx: ExtensionContext): string | undefined => {
+    const model = ctx.model as
+      | { id?: unknown; provider?: unknown }
+      | undefined;
+    if (!model) return undefined;
+    const provider = typeof model.provider === "string" ? model.provider : "";
+    const id = typeof model.id === "string" ? model.id : "";
+    return provider || id ? `${provider}/${id}` : undefined;
+  };
+
+  let lastModelKey: string | undefined;
+
+  pi.on("session_start", (_event, ctx) => {
+    lastModelKey = modelKey(ctx);
+    clearUsageStatuslines(ctx);
+  });
+
+  // A cached usage line describes the account the previous model ran on, so it
+  // is stale the moment the model changes. Pi announces that with
+  // `model_select`; OMP has no equivalent event, so detect the change at turn
+  // start instead — an event both hosts do emit.
+  pi.on("turn_start", (_event, ctx) => {
+    const current = modelKey(ctx);
+    if (current === lastModelKey) return;
+    lastModelKey = current;
+    clearUsageStatuslines(ctx);
+  });
+
+  // Pi-only: clears on selection instead of waiting for the next turn.
+  onHostEvent("model_select", (_event, ctx) => clearUsageStatuslines(ctx));
+
+  // OMP-only: a Codex credential the host just disabled (rate limit, refresh
+  // failure) invalidates whatever usage we last displayed for it.
+  onHostEvent("credential_disabled", (event, ctx) => {
+    const provider = (event as { provider?: unknown } | null)?.provider;
+    if (provider === CODEX_PROVIDER_ID) clearUsageStatuslines(ctx);
+  });
+
   pi.on("session_shutdown", (_event, ctx) => clearUsageStatuslines(ctx));
 
   const command = {

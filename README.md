@@ -2,7 +2,9 @@
 
 **pi-codex-account** for [Oh My Pi](https://ohmy.pi) (OMP) — save, switch, inspect, and manage multiple OpenAI Codex (ChatGPT) OAuth accounts.
 
-Forked from [fadilsflow/pi-codex-account](https://github.com/fadilsflow/pi-codex-account) with OMP credential storage support.
+Forked from [MateuszJuszczyk/omp-codex-account](https://github.com/MateuszJuszczyk/omp-codex-account)
+(itself a fork of [fadilsflow/pi-codex-account](https://github.com/fadilsflow/pi-codex-account)), kept
+typechecked against the OMP release actually in use.
 
 ## Problem
 
@@ -33,8 +35,11 @@ Both backends present the same commands and behaviour.
 ### From GitHub (Oh My Pi)
 
 ```bash
-pi install npm:github:MateuszJuszczyk/pi-codex-account
+omp plugin install github:seiz888/omp-codex-account
 ```
+
+`npm:github:<owner>/<repo>` is rejected by OMP as an invalid package name; use the
+`github:` form above, or the full HTTPS clone URL.
 
 ### From a local checkout
 
@@ -128,7 +133,9 @@ To restore snapshots, place the files back in the same location and run `/reload
 git clone https://github.com/MateuszJuszczyk/pi-codex-account
 cd pi-codex-account
 bun install
-bun run typecheck    # TypeScript type checks
+bun run typecheck        # types against legacy Pi
+bun run typecheck:omp    # types against OMP
+bun run typecheck:all    # both
 bun test             # Run test suite
 ```
 
